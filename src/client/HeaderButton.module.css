@@ -1,0 +1,232 @@
+/**
+ * Styles for AI Approval Header Button component.
+ */
+
+.aiApprovalHeaderBtn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  position: relative;
+}
+
+.aiApprovalToggle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  border: none;
+  border-radius: 6px;
+  background: var(--dsh-bg-tertiary, #f0f0f0);
+  color: var(--dsh-fg-secondary, #666);
+  cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease, box-shadow 0.15s ease;
+}
+
+.aiApprovalToggle:hover {
+  background: var(--dsh-bg-hover, #e0e0e0);
+}
+
+.aiApprovalToggle.enabled {
+  background: var(--dsh-primary-bg, #1890ff);
+  color: var(--dsh-primary-fg, #fff);
+}
+
+.aiApprovalToggle.enabled:hover {
+  background: var(--dsh-primary-hover, #096dd9);
+  box-shadow: 0 0 0 2px var(--dsh-primary-light, rgba(24, 144, 255, 0.2));
+}
+
+.aiApprovalToggle.disabled {
+  background: var(--dsh-bg-tertiary, #f0f0f0);
+  color: var(--dsh-fg-tertiary, #999);
+}
+
+.aiApprovalToggle.disabled:hover {
+  background: var(--dsh-bg-hover, #e0e0e0);
+}
+
+.aiApprovalIcon {
+  width: 16px;
+  height: 16px;
+}
+
+.aiApprovalStatsTrigger {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 56px;
+  height: 28px;
+  padding: 0 8px;
+  border: none;
+  border-radius: 6px;
+  background: var(--dsh-bg-tertiary, #f0f0f0);
+  color: var(--dsh-fg-primary, #333);
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background 0.15s ease;
+}
+
+.aiApprovalStatsTrigger:hover {
+  background: var(--dsh-bg-hover, #e0e0e0);
+}
+
+.aiApprovalStatsSummary {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.aiApprovalTotal {
+  color: var(--dsh-fg-primary, #333);
+}
+
+.aiApprovalSep {
+  color: var(--dsh-fg-tertiary, #999);
+}
+
+.aiApprovalRate {
+  color: var(--dsh-success, #52c41a);
+  font-weight: 600;
+}
+
+.aiApprovalDropdown {
+  position: absolute;
+  top: calc(100% + 4px);
+  right: 0;
+  min-width: 220px;
+  background: var(--dsh-bg-primary, #fff);
+  border: 1px solid var(--dsh-border, #e0e0e0);
+  border-radius: 8px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.12);
+  z-index: 1000;
+  overflow: hidden;
+  animation: aiApprovalDropdownIn 0.12s ease-out;
+}
+
+@keyframes aiApprovalDropdownIn {
+  from {
+    opacity: 0;
+    transform: translateY(-4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.aiApprovalDropdownHeader {
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--dsh-border, #e0e0e0);
+  background: var(--dsh-bg-secondary, #fafafa);
+}
+
+.aiApprovalDropdownTitle {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--dsh-fg-primary, #333);
+}
+
+.aiApprovalDropdownStats {
+  padding: 8px 0;
+}
+
+.aiApprovalStatRow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  font-size: 12px;
+  color: var(--dsh-fg-primary, #333);
+}
+
+.aiApprovalStatRow:hover {
+  background: var(--dsh-bg-hover, #f5f5f5);
+}
+
+.aiApprovalStatIcon {
+  width: 14px;
+  height: 14px;
+  flex-shrink: 0;
+}
+
+.aiApprovalStatRow.approved .aiApprovalStatIcon {
+  color: var(--dsh-success, #52c41a);
+}
+
+.aiApprovalStatRow.denied .aiApprovalStatIcon {
+  color: var(--dsh-error, #ff4d4f);
+}
+
+.aiApprovalStatRow.error .aiApprovalStatIcon {
+  color: var(--dsh-warning, #faad14);
+}
+
+.aiApprovalStatLabel {
+  flex: 1;
+  text-align: left;
+}
+
+.aiApprovalStatValue {
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+.aiApprovalStatRow.approved .aiApprovalStatValue {
+  color: var(--dsh-success, #52c41a);
+}
+
+.aiApprovalStatRow.denied .aiApprovalStatValue {
+  color: var(--dsh-error, #ff4d4f);
+}
+
+.aiApprovalStatRow.error .aiApprovalStatValue {
+  color: var(--dsh-warning, #faad14);
+}
+
+.aiApprovalStatRow.total .aiApprovalStatValue {
+  color: var(--dsh-fg-primary, #333);
+}
+
+.aiApprovalDropdownDivider {
+  height: 1px;
+  background: var(--dsh-border, #e0e0e0);
+  margin: 4px 0;
+}
+
+.aiApprovalDropdownActions {
+  padding: 4px 0;
+}
+
+.aiApprovalSettingsBtn {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 8px 12px;
+  border: none;
+  background: transparent;
+  color: var(--dsh-fg-primary, #333);
+  font-size: 13px;
+  cursor: pointer;
+  text-align: left;
+  transition: background 0.15s ease;
+}
+
+.aiApprovalSettingsBtn:hover {
+  background: var(--dsh-bg-hover, #f5f5f5);
+}
+
+.aiApprovalSettingsIcon {
+  width: 14px;
+  height: 14px;
+  color: var(--dsh-fg-tertiary, #999);
+}
+
+.aiApprovalBackdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 999;
+  background: transparent;
+}
