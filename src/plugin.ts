@@ -13,11 +13,12 @@ import type { Context } from '@deepseek-ai/cordis'
 import { installSettingsSection, settingsNamespace } from '@deepseek-ai/dsh-settings'
 import Schema from '@deepseek-ai/schemastery'
 import type { Agent } from '@deepseek-ai/dsh-agent'
+import type { SessionHeader } from '@deepseek-ai/dsh-session'
 import type { ApprovalService } from '@deepseek-ai/dsh-user-approval'
 import { readFileSync, existsSync, mkdirSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { needsReview, isAutoAllowed, hashArgs } from './filter.ts'
-import { startReviewer } from './reviewer.ts'
+import { startReviewer, removeReviewerSession } from './reviewer.ts'
 import { ApprovalCache } from './cache.ts'
 import type { ApprovalConfig, ReviewDecision } from './types.ts'
 import { foldSubagentDescriptor } from './descriptor.ts'
@@ -310,34 +311,103 @@ export function apply(ctx: Context, config: ApprovalConfig): void {
   // permission-poor composition instead of the main agent's full preset.
   // Its session never runs a turn, so it stays `blank` and is hidden from the
   // session list by the workspace tree. The working directory is the plugin
-  // data folder's `workspace` sub-directory.
+  // data folder's `safe-tool-log` sub-directory.
   const REVIEWER_PARENT_SESSION = 'dsh-safe-tool-reviewer-parent'
-  const reviewerWorkspaceDir = join(criteriaDir, 'workspace')
+  const reviewerWorkspaceDir = join(criteriaDir, 'safe-tool-log')
   try {
     mkdirSync(reviewerWorkspaceDir, { recursive: true })
   } catch {
     // Non-fatal: agent creation validates cwd existence and will fail loud if unusable.
   }
 
-  let reviewerParentPromise: Promise<Agent> | undefined
+  // A minimal "empty turn" seed (turn/start + turn/end, no step, no message)
+  // that marks the parent session non-blank so dsh's session list renders it.
+  // A turn with no step is explicitly legal ("Rejection, empty input, … may
+  // close it with no step"), and a balanced log needs no crash-repair, so this
+  // seed neither triggers a model call nor synthesises any repair events.
+  function emptyTurnSeed(): Array<Record<string, unknown>> {
+    const t = Date.now()
+    return [
+      { type: 'turn/start', seq: 0, time: t, data: { turn: 1 } },
+      { type: 'turn/end', seq: 1, time: t, data: { turn: 1, reason: { kind: 'completed' } } },
+    ]
+  }
 
-  function ensureReviewerParent(presetId: string): Promise<Agent> {
-    if (reviewerParentPromise !== undefined) return reviewerParentPromise
-    reviewerParentPromise = (async () => {
-      const agents = ctx.get('agents') as unknown as {
-        get?: (id: string) => Agent | undefined
-        create: (opts: Record<string, unknown>) => Promise<{ agent: Agent }>
+  /**
+   * Delete every persisted review-subagent session whose durable parent is the
+   * review parent agent. Called when the visibility flips to "invisible"
+   * (delete mode) so records accumulated while it was visible don't linger.
+   * The parent's own session is empty and never persisted, so only its
+   * children (origin 'subagent', parentSession = the parent id) are enumerated.
+   */
+  async function cleanupReviewerSessions(): Promise<void> {
+    try {
+      const persistence = ctx.get('sessionPersistence') as {
+        list?: () => Promise<SessionHeader[]>
+      } | undefined
+      if (typeof persistence?.list !== 'function') return
+      const headers = await persistence.list()
+      const children = headers.filter(h =>
+        h.parentSession === REVIEWER_PARENT_SESSION && h.origin === 'subagent',
+      )
+      for (const header of children) {
+        await removeReviewerSession(ctx, header)
       }
-      // Reuse an already-published agent (e.g. across HMR reloads).
-      const existing = agents.get?.(REVIEWER_PARENT_SESSION)
-      if (existing !== undefined) return existing
+    } catch {
+      // Best-effort: leftover records are inert (hidden with the parent).
+    }
+  }
+
+  // Cached reviewer parent: the handle owns `dispose` (the registry returns a
+  // bare Agent), so rebuilding on a visibility flip can tear the old one down.
+  let reviewerParent: { handle: { agent: Agent; dispose: () => Promise<void> }; visible: boolean } | undefined
+  let reviewerParentPending: Promise<Agent> | undefined
+
+  /**
+   * Lazily create (or rebuild) the dedicated review parent agent.
+   *
+   * `visible` mirrors `!deleteReviewerSessions`: when the caller keeps review
+   * subagent sessions, the parent must be a normal, non-blank session so it
+   * shows in the session list as the entry point to inspect those subagents.
+   * When the caller deletes them, the parent stays an `origin: 'subagent'`,
+   * blank session that remains hidden (the current behaviour). A visibility
+   * flip discards the old agent and recreates it under the same stable id —
+   * safe because its own session is empty (never persisted).
+   */
+  function ensureReviewerParent(presetId: string, visible: boolean): Promise<Agent> {
+    if (reviewerParent !== undefined && reviewerParent.visible === visible) {
+      return Promise.resolve(reviewerParent.handle.agent)
+    }
+    if (reviewerParentPending !== undefined) return reviewerParentPending
+    reviewerParentPending = (async () => {
+      const agents = ctx.get('agents') as unknown as {
+        create: (opts: Record<string, unknown>) => Promise<{ agent: Agent; dispose: () => Promise<void> }>
+      }
+      // Rebuild: tear down the previous agent (its session is empty, so no
+      // history is lost), then create a fresh one under the same id.
+      if (reviewerParent !== undefined) {
+        const wasVisible = reviewerParent.visible
+        const old = reviewerParent
+        reviewerParent = undefined
+        try {
+          await old.handle.dispose()
+        } catch {
+          // Best-effort: the registry clears the id on teardown.
+        }
+        // Flipping visible → invisible switches to "delete review records";
+        // drop the subagent sessions that accumulated while it was visible.
+        if (wasVisible && !visible) {
+          await cleanupReviewerSessions()
+        }
+      }
       const handle = await agents.create({
         sessionId: REVIEWER_PARENT_SESSION,
         meta: {
           cwd: reviewerWorkspaceDir,
           agentPreset: presetId,
-          origin: 'subagent',
+          ...(visible ? {} : { origin: 'subagent' }),
         },
+        seed: visible ? emptyTurnSeed() : undefined,
         agentOptions: {},
         setup: async (agentCtx: Context) => {
           const presets = agentCtx.get('agentPresets') as {
@@ -346,13 +416,14 @@ export function apply(ctx: Context, config: ApprovalConfig): void {
           await presets.mount(agentCtx, presetId)
         },
       })
+      reviewerParent = { handle, visible }
       return handle.agent
     })().catch((error: unknown) => {
-      // Reset so a later review can retry instead of caching the failure.
-      reviewerParentPromise = undefined
       throw error
+    }).finally(() => {
+      reviewerParentPending = undefined
     })
-    return reviewerParentPromise
+    return reviewerParentPending
   }
 
   // Auto-create criteria file if not exists
@@ -444,7 +515,9 @@ export function apply(ctx: Context, config: ApprovalConfig): void {
       // review keeps working under the inherited composition.
       let reviewerParent: Agent
       try {
-        reviewerParent = await ensureReviewerParent(cfg.reviewerPreset)
+        // visible = !deleteReviewerSessions: when we keep review subagent
+        // records, the parent shows in the session list as their entry point.
+        reviewerParent = await ensureReviewerParent(cfg.reviewerPreset, !cfg.deleteReviewerSessions)
       } catch {
         reviewerParent = exec.agent
       }

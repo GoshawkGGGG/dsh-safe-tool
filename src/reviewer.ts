@@ -58,7 +58,7 @@ function settle(ms: number): Promise<void> {
  * Best-effort: any failure is swallowed, leaving the record behind rather
  * than failing the review.
  */
-async function removeReviewerSession(
+export async function removeReviewerSession(
   ctx: Context,
   header: SessionHeader | undefined,
 ): Promise<void> {
