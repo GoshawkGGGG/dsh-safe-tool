@@ -400,22 +400,29 @@ export function apply(ctx: Context, config: ApprovalConfig): void {
           await cleanupReviewerSessions()
         }
       }
-      const handle = await agents.create({
-        sessionId: REVIEWER_PARENT_SESSION,
-        meta: {
-          cwd: reviewerWorkspaceDir,
-          agentPreset: presetId,
-          ...(visible ? {} : { origin: 'subagent' }),
-        },
-        seed: visible ? emptyTurnSeed() : undefined,
-        agentOptions: {},
-        setup: async (agentCtx: Context) => {
-          const presets = agentCtx.get('agentPresets') as {
-            mount: (ctx: Context, id: string) => Promise<unknown>
-          }
-          await presets.mount(agentCtx, presetId)
-        },
-      })
+      let handle: { agent: Agent; dispose: () => Promise<void> }
+      try {
+        handle = await agents.create({
+          sessionId: REVIEWER_PARENT_SESSION,
+          meta: {
+            cwd: reviewerWorkspaceDir,
+            agentPreset: presetId,
+            ...(visible ? {} : { origin: 'subagent' }),
+          },
+          seed: visible ? emptyTurnSeed() : undefined,
+          agentOptions: {},
+          setup: async (agentCtx: Context) => {
+            const presets = agentCtx.get('agentPresets') as {
+              mount: (ctx: Context, id: string) => Promise<unknown>
+            }
+            await presets.mount(agentCtx, presetId)
+          },
+        })
+      } catch (error) {
+        console.error('[dsh-safe-tool][ensureReviewerParent] agents.create FAILED:', error)
+        throw error
+      }
+//      console.log('[dsh-safe-tool][ensureReviewerParent] created ok, agent.session.id =', handle.agent.session.id, 'cwd =', handle.agent.session?.header?.cwd, 'presetId =', presetId, 'visible =', visible)
       reviewerParent = { handle, visible }
       return handle.agent
     })().catch((error: unknown) => {
@@ -500,7 +507,7 @@ export function apply(ctx: Context, config: ApprovalConfig): void {
       toolName: exec.name,
       toolDescription: extractToolDescription(ctx, exec.name),
       args: JSON.stringify(exec.arguments, null, 2),
-      workspace: exec.agent?.cwd ?? process.cwd(),
+      workspace: exec.agent?.session?.header?.cwd ?? process.cwd(),
       criteria: criteriaText,
     })
 
@@ -518,7 +525,8 @@ export function apply(ctx: Context, config: ApprovalConfig): void {
         // visible = !deleteReviewerSessions: when we keep review subagent
         // records, the parent shows in the session list as their entry point.
         reviewerParent = await ensureReviewerParent(cfg.reviewerPreset, !cfg.deleteReviewerSessions)
-      } catch {
+      } catch (error) {
+        console.error('[dsh-safe-tool] ensureReviewerParent FAILED, FALLBACK to main agent:', error)
         reviewerParent = exec.agent
       }
       decision = await startReviewer(ctx, {

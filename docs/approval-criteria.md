@@ -1,72 +1,44 @@
-# AI 命令执行审批标准
-
-## 允许执行
-
-以下类型的命令通常可以安全执行：
-
-### 只读文件操作
-- `cat`, `head`, `tail`, `wc`, `less`, `more`
-- `grep`, `rg`, `find`, `ls`, `stat`
-- `diff`, `md5sum`, `sha256sum`
-
-### 项目构建和测试
-- `npm install`, `pnpm install`, `yarn install`
-- `npm run build`, `pnpm build`, `tsc`
-- `npm test`, `pnpm test`, `jest`, `vitest`
-- `npm run dev`, `pnpm dev`
-
-### Git 查看操作
-- `git status`, `git log`, `git diff`, `git show`
-- `git branch`, `git tag`
-
-### 系统状态查看
-- `ps`, `top`, `htop`, `docker ps`
-- `df`, `free`, `uptime`, `uname`
-- `curl` GET 请求（不含敏感 header）
-
+# 核心原则
+1. 审批依据只来自这里，不编造不存在的规定。
+2. 结论必须明确（"approve": true/false），理由必须完整。
+3. 输出格式必须解析函数严格匹配，理由不得为空。
 ---
-
-## 拒绝执行
-
-以下类型的命令存在安全风险，应被拒绝：
-
-### 删除操作
-- `rm -rf`, `rm -r`, `rm --recursive`
-- `unlink`, `truncate`, `hollow`
-- 任何删除目录或大量文件的命令
-
-### 高危网络请求
-- `curl` POST/PUT 含 `token`, `key`, `password`, `secret` 参数
-- `nc`, `netcat`, `nmap` 端口扫描
-- 连接到非预期域名的请求
-
-### 系统级修改
-- 写入 `/etc/`, `/usr/`, `/sbin/`, `/bin/`
-- `apt install`, `yum install`, `pacman -S`（包管理器）
-- 修改系统服务配置
-
-### 权限提升
-- `sudo`, `su`, `chmod 777`, `chown root`
-- 任何涉及特权提升的命令
-
-### 加密货币/挖矿
-- 任何包含 `mining`, `coinbase`, `stratum` 关键字的命令
-
-### 数据库危险操作
-- `DROP DATABASE`, `DROP TABLE`
-- `TRUNCATE TABLE`
-- `DELETE` 无 `WHERE` 条件的 SQL
-
-### 敏感文件写入
-- 写入 `.env`, `.env.local`
-- 写入 `~/.ssh/`, `id_rsa`, `authorized_keys`
-- 写入 `~/.config/` 中的认证相关文件
-
+# 审批判定标准
+## 一. 安全红线
+### 1.1 凭据安全
+- 禁止以任何形式读取、打印、输出 token/API Key/密码/密钥，包括.env文件、各系统程序的配置、命令输出等生产环境操作。除了像config.php这种专门用来存储配置的源码文件，源码中不会也不应包含上述凭据，对非配置存储类源码进行读取可放行，不得干扰正常项目源码读取。
+- 禁止打印变量长度、前缀、后缀做调试。
+- 禁止通过 `env`/`printenv`/`$VAR`/`${VAR}` 等方式获取环境变量实际值。
+- 允许在不显示明文的情况下传递环境变量引用（如 `${VLLM_API_KEY}` 用于接口授权）。
+- 调试统一用假值 `fake_token_for_test_only_1234`。
+### 1.2 Shell 执行黑名单
+- 禁止 `env`/`printenv` 搭配 grep、awk、命令替换。
+- 禁止环境变量展开明文、切片。
+- 禁止工作区和/tmp外执行高风险命令：`rm -rf`、系统配置修改。
+- 文件操作优先内置 `read`/`edit`/`write` 工具。
+### 1.3 SSL/TLS 证书安全
+外部连接出现证书异常（`certificate verify failed`、`self signed`、`hostname mismatch`、curl 错误码 35/51/60）**必须终止连接并上报**，禁止 `-k/--insecure` 绕过。请求无异常时不得干扰正常网络通信。
+### 1.4 文件编辑
+修改已有配置/规则文档**仅用 `edit` 精确片段替换**，禁止无授权用 `write` 全量覆盖。
 ---
-
-## 审查原则
-
-1. **安全第一**：宁可误判拒绝，也不放过高风险命令
-2. **上下文感知**：CI 环境（有 `CI=true` 环境变量）可适当放宽构建类操作
-3. **未知工具审慎**：无法确认用途的工具调用默认拒绝
-4. **描述缺失则拒绝**：tool description 为空时要求补充说明
+## 二. 快速判断
+### 2.1 直接放行（"approve": true）
+- 不违反任何安全红线，不触发任何拒绝条件
+- 仅读取日志/配置/普通文本文件，无修改/删除/覆盖操作
+- 仅切换工作目录、查看进程、基础资源查询，无环境变量/密钥遍历
+- 仅创建临时普通文件，无系统级配置、环境变量变更
+- 普通目录列表命令（如 `ls`、`Get-ChildItem` 查看用户桌面、文档等常规路径）
+### 2.2 直接拒绝（"approve": false）
+- 读取、修改、删除审批标准文件：$DSH_HOME/dsh-safe-tool/approval-criteria.md
+- 非清理临时文件或在工作区及/tmp以外的文件夹未经授权或无必要的 `rm`、`rm -rf`命令执行。
+- 删除工作区内敏感文件：skill 文件、`AGENTS.md`、`SOUL.md` 等 Agent 配置文件、记忆或知识图谱文件。
+- 覆盖系统配置、直接读写/打印环境变量、密钥、token。
+- 执行参数含 `-k/--insecure`、自签名证书、外网代理绕过安全校验。
+- 无归属确认的文件删除、高危系统变更命令。
+- 读取/导出用户的凭据文件（如 `.env`、`*.key`、`*credential*`、`*ssh*`）
+- 读取/导出用户的私人笔记、备忘录、平台聊天记录（与agent的单独聊天记录可以读取）等个人隐私内容
+- 复制导出（可以读取与修改）Agent 自身的会话文件、记忆文件、配置文件
+- 尝试修改DSH生产环境核心配置文件。
+### 2.3 存疑拒绝（"approve": false）
+- 命令用途模糊、二进制程序可疑、操作目标不清晰时拒绝，并明确告知需要补充的信息。
+---

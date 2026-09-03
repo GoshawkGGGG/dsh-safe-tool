@@ -367,9 +367,12 @@ function lookupKey(obj: Record<string, unknown>, want: string): unknown {
  * `undefined` when nothing recognisable is found.
  */
 function decisionFromText(text: string): ReviewDecision | undefined {
-  // Strategy A: locate and parse an embedded JSON object.
-  const jsonCandidate = extractJsonObject(text)
-  if (jsonCandidate !== undefined) {
+  // Strategy A: walk the balanced `{...}` objects in REVERSE order (the
+  // trailing object first) and return the FIRST one that yields a decision.
+  // This is a security boundary: the verdict is the last thing the model
+  // writes, so we must never let an earlier JSON (a copied tool argument, a
+  // command body) outrank it.
+  for (const jsonCandidate of extractJsonObjectsReverse(text)) {
     const parsed = safeJsonParse(jsonCandidate)
     if (parsed !== undefined && typeof parsed === 'object' && !Array.isArray(parsed)) {
       const fromJson = decisionFromRecord(parsed as Record<string, unknown>)
@@ -382,58 +385,116 @@ function decisionFromText(text: string): ReviewDecision | undefined {
 }
 
 /**
- * Extract the first balanced `{...}` span from `text`, skipping JSON code
- * fences when present. Returns the substring (without a wrapping fence) or
- * `undefined`.
+ * Extract every balanced `{...}` span from `text`, in REVERSE order (last
+ * first). The model's authoritative decision JSON sits at the very end of its
+ * reply; everything before it — thinking preamble, a copy of the tool's JSON
+ * arguments, a `bash` command body that itself embeds JSON — is noise that must
+ * never be mistaken for the verdict. Returning last-first lets the caller try
+ * the trailing object first and walk backwards only when it fails to yield a
+ * decision.
  */
-function extractJsonObject(text: string): string | undefined {
-  // Prefer a fenced json block when the model wrapped its output.
-  const fence = text.match(/```(?:json|JSON)?\s*\n?([\s\S]*?)\n?```/)
-  let candidate: string | undefined
-  if (fence) {
-    candidate = (fence[1] ?? '').trim()
-  } else {
-    const start = text.indexOf('{')
-    if (start === -1) return undefined
-    // Walk to the matching close brace, honouring strings.
-    let depth = 0
-    let inString = false
-    let escaped = false
-    for (let i = start; i < text.length; i++) {
-      const ch = text[i]
-      if (inString) {
-        if (escaped) escaped = false
-        else if (ch === '\\') escaped = true
-        else if (ch === '"') inString = false
-        continue
-      }
-      if (ch === '"') { inString = true; continue }
-      if (ch === '{') depth++
-      else if (ch === '}') {
-        depth--
-        if (depth === 0) {
-          candidate = text.slice(start, i + 1)
-          break
-        }
-      }
-    }
-    if (candidate === undefined) return undefined
+function extractJsonObjectsReverse(text: string): string[] {
+  const result: string[] = []
+  let searchEnd = text.length
+  for (;;) {
+    const open = text.lastIndexOf('{', searchEnd - 1)
+    if (open === -1) break
+    const candidate = scanBalancedObject(text, open)
+    if (candidate !== undefined) result.push(candidate)
+    searchEnd = open
   }
-  return candidate
+  return result
 }
 
-/** `JSON.parse` with tolerant preprocessing for single quotes / trailing commas. */
+/** Scan from `start` to its matching `}`, honouring strings; undefined if unbalanced. */
+function scanBalancedObject(text: string, start: number): string | undefined {
+  let depth = 0
+  let inString = false
+  let escaped = false
+  for (let i = start; i < text.length; i++) {
+    const ch = text[i]
+    if (inString) {
+      if (escaped) escaped = false
+      else if (ch === '\\') escaped = true
+      else if (ch === '"') inString = false
+      continue
+    }
+    if (ch === '"') { inString = true; continue }
+    if (ch === '{') depth++
+    else if (ch === '}') {
+      depth--
+      if (depth === 0) return text.slice(start, i + 1)
+    }
+  }
+  return undefined
+}
+
+/** Fold raw newlines inside string literals into spaces so multi-line values parse. */
+function foldInnerNewlines(text: string): string {
+  let out = ''
+  let inString = false
+  let escaped = false
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i]
+    if (inString) {
+      if (escaped) {
+        escaped = false
+        out += ch
+        continue
+      }
+      if (ch === '\\') {
+        escaped = true
+        out += ch
+        continue
+      }
+      if (ch === '"') {
+        inString = false
+        out += ch
+        continue
+      }
+      // A raw newline inside a string value is illegal JSON; fold it to a
+      // space so the (Chinese, single-line-ish) reason survives without
+      // breaking the parse. Structural newlines stay untouched.
+      if (ch === '\n' || ch === '\r') {
+        out += ' '
+        continue
+      }
+      out += ch
+      continue
+    }
+    if (ch === '"') {
+      inString = true
+      out += ch
+      continue
+    }
+    out += ch
+  }
+  return out
+}
+
+/** `JSON.parse` with tolerant preprocessing for non-standard encodings. */
 function safeJsonParse(text: string): unknown {
   try {
     return JSON.parse(text)
   } catch {
     // Fall through to permissive forms.
   }
+  // Normalise CJK full-width punctuation that Chinese-facing models commonly
+  // emit in place of ASCII JSON syntax: curly double/single quotes, full-width
+  // colon and comma. Then fold raw newlines inside string values.
+  const normalized = foldInnerNewlines(
+    text
+      .replace(/[\u201C\u201D]/g, '"')
+      .replace(/[\u2018\u2019]/g, "'")
+      .replace(/\uFF1A/g, ':')
+      .replace(/\uFF0C/g, ','),
+  )
   const attempts = [
+    normalized,
     // Unquoted keys → quoted keys (`approve:` → `"approve":`).
-    text.replace(/([{,]\s*)([A-Za-z_\u4e00-\u9fa5][A-Za-z0-9_\u4e00-\u9fa5]*)\s*:/g, '$1"$2":'),
+    normalized.replace(/([{,]\s*)([A-Za-z_\u4e00-\u9fa5][A-Za-z0-9_\u4e00-\u9fa5]*)\s*:/g, '$1"$2":'),
     // Single-quoted strings → double-quoted.
-    text.replace(/'([^']*)'/g, '"$1"'),
+    normalized.replace(/'([^']*)'/g, '"$1"'),
   ]
   for (const candidate of attempts) {
     try {
@@ -457,7 +518,12 @@ function decisionFromKeyValueLines(text: string): ReviewDecision | undefined {
   )
   let approve: boolean | undefined
   let reason: string | undefined
-  for (const line of text.split(/\r?\n/)) {
+  // Walk lines in REVERSE order: the model's final verdict is the trailing
+  // one, so the last `approve`/`reason` seen wins — an earlier copied key-value
+  // (e.g. a quoted tool argument re-emitted verbatim) must never outrank it.
+  const lines = text.split(/\r?\n/)
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i] ?? ''
     if (approve === undefined) {
       const m = line.match(approveLine)
       if (m) approve = normalizeApprove((m[2] ?? '').trim())
