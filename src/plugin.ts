@@ -497,6 +497,21 @@ export function apply(ctx: Context, config: ApprovalConfig): void {
       }
     }
 
+    // Validate the CONFIGURED reviewer provider/model against dsh BEFORE
+    // launching the review subagent. A configured provider/model that dsh
+    // does not know would otherwise make every review subagent fail to
+    // resolve and silently surface as a misleading "[人工审批] 用户拒绝".
+    // Fail fast with an actionable message instead.
+    const invalidRoute = await checkReviewerModelRoute(ctx, cfg, exec.agent)
+    if (invalidRoute !== undefined) {
+      // A config error is a review error: the review subagent never ran, so
+      // record it as an error-denied so the header stats reflect the failure
+      // instead of silently dropping the intercept.
+      const sessionId = exec.agent?.session?.id ?? exec.agent?.sessionId ?? 'default'
+      recordStats(String(sessionId), true, false)
+      return { kind: 'deny' as const, reason: invalidRoute }
+    }
+
     // Read latest approval criteria on every call (supports live editing)
     const criteriaText = existsSync(criteriaPath)
       ? readFileSync(criteriaPath, 'utf-8')
@@ -675,6 +690,55 @@ function extractToolDescription(ctx: Context, toolName: string): string {
     // Ignore — tool description is optional
   }
   return '(无描述)'
+}
+
+/**
+ * Verify that a CONFIGURED reviewer provider/model actually exists in dsh.
+ *
+ * The reviewer route is `cfg.provider ?? agent.options.provider` (and the
+ * model analogue). Inherited values are valid by construction — the main
+ * agent is already running on them — so only explicitly configured values are
+ * checked here. A configured provider or model that dsh does not know would
+ * otherwise make every review subagent fail to resolve and surface as a
+ * misleading "[人工审批] 用户拒绝"; return the actionable error instead.
+ *
+ * @returns an error message when the route is invalid, or `undefined` when it
+ *   is usable (or when nothing is configured / the LLM registry is absent).
+ */
+async function checkReviewerModelRoute(
+  ctx: Context,
+  cfg: ApprovalConfig,
+  agent: Agent,
+): Promise<string | undefined> {
+  // Nothing configured → the route is fully inherited, valid by construction.
+  if (cfg.provider === undefined && cfg.model === undefined) return undefined
+
+  const llm = ctx.get('llm') as {
+    listProviders?: () => Array<{ id: string }>
+    resolveModelInfo?: (provider: string, model: string) => Promise<unknown>
+  } | undefined
+  // No LLM registry to validate against — nothing here can be confirmed wrong.
+  if (llm === undefined) return undefined
+
+  // The provider the reviewer will actually route through.
+  const provider = cfg.provider ?? agent.options.provider
+
+  if (cfg.provider !== undefined) {
+    const providers = llm.listProviders?.() ?? []
+    if (!providers.some((p) => p.id === cfg.provider)) {
+      return '审核模型配置无效，请检查模型配置'
+    }
+  }
+
+  if (cfg.model !== undefined && provider !== undefined) {
+    try {
+      await llm.resolveModelInfo?.(provider, cfg.model)
+    } catch {
+      return '审核模型配置无效，请检查模型配置'
+    }
+  }
+
+  return undefined
 }
 
 const DEFAULT_CRITERIA = `## 允许执行
