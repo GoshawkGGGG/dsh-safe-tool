@@ -13,7 +13,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import { installSettingsSection, settingsNamespace } from '@deepseek-ai/dsh-settings'
 import Schema from '@deepseek-ai/schemastery'
 import type { Agent } from '@deepseek-ai/dsh-agent'
-import type { SessionHeader } from '@deepseek-ai/dsh-session'
+import type { SessionEvent, SessionHeader } from '@deepseek-ai/dsh-session'
 import type { ApprovalService } from '@deepseek-ai/dsh-user-approval'
 import { readFileSync, existsSync, mkdirSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
@@ -343,15 +343,33 @@ export function apply(ctx: Context, config: ApprovalConfig): void {
   async function cleanupReviewerSessions(): Promise<void> {
     try {
       const persistence = ctx.get('sessionPersistence') as {
-        list?: () => Promise<SessionHeader[]>
+        list?: (signal?: AbortSignal) => Promise<SessionHeader[]>
+        inspect?: (id: string, signal?: AbortSignal) => Promise<{ meta: SessionHeader; events: readonly SessionEvent[] }>
       } | undefined
       if (typeof persistence?.list !== 'function') return
       const headers = await persistence.list()
-      const children = headers.filter(h =>
-        h.parentSession === REVIEWER_PARENT_SESSION && h.origin === 'subagent',
-      )
-      for (const header of children) {
-        await removeReviewerSession(ctx, header)
+      for (const header of headers) {
+        if (header.origin !== 'subagent') continue
+        // 当前版：审批子代理挂在专用 reviewer parent 下，parentSession 精确命中。
+        if (header.parentSession === REVIEWER_PARENT_SESSION) {
+          await removeReviewerSession(ctx, header)
+          continue
+        }
+        // 历史残留：旧版没有 reviewer parent，审批子代理直接挂在主会话下，
+        // parentSession 是主会话 id。用 descriptor 的 label 兜底识别，避免
+        // 误删用户正常的 subagent 会话（它们的 label 不同）。
+        if (typeof persistence.inspect !== 'function') continue
+        let label: string | undefined
+        try {
+          const inspected = await persistence.inspect(header.id)
+          label = foldSubagentDescriptor(inspected.events)?.label
+        } catch {
+          // 单个会话读取失败不影响整批清理。
+          continue
+        }
+        if (label === PLUGIN_REVIEWER_LABEL) {
+          await removeReviewerSession(ctx, header)
+        }
       }
     } catch {
       // Best-effort: leftover records are inert (hidden with the parent).
