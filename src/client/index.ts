@@ -7,8 +7,16 @@
  * @module dsh-safe-tool/client
  */
 
-import type { ClientContext, SessionId } from '@deepseek-ai/dsh-client-runtime/client'
-import { createSnapshotStore } from '@deepseek-ai/dsh-client-runtime/client'
+import type { Context as ClientContext } from '@deepseek-ai/cordis'
+import type { SessionId } from '@deepseek-ai/dsh-session/types'
+import { createSnapshotStore } from '@deepseek-ai/dsh-client-store'
+// Type-only augmentation imports (erased from the bundle): `ctx.slots`,
+// `ctx.remote`, the session-scope `sessionId` standard prop, and the SlotMap
+// entries for the two slots this plugin contributes into.
+import type {} from '@deepseek-ai/dsh-client-ui-renderer/client'
+import type {} from '@deepseek-ai/dsh-api-remotes/client'
+import type {} from '@deepseek-ai/dsh-client-ui-session/client'
+import type {} from '@deepseek-ai/dsh-client-ui-settings-plugins/client'
 import type {} from '@deepseek-ai/dsh-client-ui-conversation/client'
 import {
   ApprovalHeaderButton,
@@ -117,7 +125,7 @@ export function apply(ctx: ClientContext): void {
     void fetchStats().then(sessions => {
       statsStore.set({ loading: false, sessions })
     }).catch(() => {
-      statsStore.set(s => ({ ...s, loading: false }))
+      statsStore.update(draft => { draft.loading = false })
     })
   }
   ctx.effect(
@@ -128,14 +136,13 @@ export function apply(ctx: ClientContext): void {
   )
   refreshStats()
 
-  // Settings card (free-search pattern: keyed by namespace, plain useState + fetch).
+  // Settings card. `settings.plugin.item` is a keyed slot: the entry is keyed
+  // by the settings namespace, and keyed registrations carry no id/order.
   ctx.slots.inject('settings.plugin.item', () =>
     ctx.slots.register(
       {
         name: 'settings.plugin.item',
         key: 'dsh-safe-tool',
-        id: 'dsh-safe-tool',
-        order: 120,
         inject: () => ({}),
       },
       ApprovalCard,

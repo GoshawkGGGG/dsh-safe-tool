@@ -11,7 +11,7 @@
 
 import { useCallback, useEffect, useState, type ReactNode } from 'react'
 import type { InjectFace, PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
-import type { SnapshotStore } from '@deepseek-ai/dsh-client-runtime/client'
+import type { SnapshotStore } from '@deepseek-ai/dsh-client-store'
 
 const NS = 'dsh-safe-tool'
 const BRIDGE_PREFIX = '/api/dsh-safe-tool-settings'

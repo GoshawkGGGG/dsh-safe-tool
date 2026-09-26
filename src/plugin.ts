@@ -337,25 +337,74 @@ export function apply(ctx: Context, config: ApprovalConfig): void {
    * Delete every persisted review-subagent session whose durable parent is the
    * review parent agent. Called when the visibility flips to "invisible"
    * (delete mode) so records accumulated while it was visible don't linger.
-   * The parent's own session is empty and never persisted, so only its
-   * children (origin 'subagent', parentSession = the parent id) are enumerated.
+   *
+   * `sessionPersistence.list()` yields snapshots (`{ header, revision, … }`),
+   * never bare headers, so the durable parent/child fields must be read off
+   * `snapshot.header` — reading them off the snapshot itself yields `undefined`
+   * and silently matches nothing.
    */
   async function cleanupReviewerSessions(): Promise<void> {
     try {
       const persistence = ctx.get('sessionPersistence') as {
-        list?: () => Promise<SessionHeader[]>
+        list?: () => Promise<Array<{ header: SessionHeader }>>
       } | undefined
       if (typeof persistence?.list !== 'function') return
-      const headers = await persistence.list()
-      const children = headers.filter(h =>
-        h.parentSession === REVIEWER_PARENT_SESSION && h.origin === 'subagent',
-      )
+      const snapshots = await persistence.list()
+      const children = snapshots
+        .map((snapshot) => snapshot.header)
+        .filter(h =>
+          h.parentSession === REVIEWER_PARENT_SESSION && h.origin === 'subagent',
+        )
       for (const header of children) {
         await removeReviewerSession(ctx, header)
       }
     } catch {
       // Best-effort: leftover records are inert (hidden with the parent).
     }
+  }
+
+  /**
+   * Read the persisted header of the dedicated review parent, when one exists.
+   *
+   * A fixed session id can only be created once: `agents.create` routes to
+   * `sessionPersistence.create`, which throws `SessionAlreadyExistsError` as
+   * soon as a log for that id exists. Existence must therefore be checked
+   * before deciding between resume and create. `stat(id)` reports both a
+   * materialized log and an unmaterialized in-process one.
+   *
+   * @returns the stored header, or `undefined` when absent or unreadable.
+   */
+  async function storedReviewerParentHeader(): Promise<SessionHeader | undefined> {
+    try {
+      const persistence = ctx.get('sessionPersistence') as {
+        stat?: (id: string) => Promise<{ header: SessionHeader } | undefined>
+      } | undefined
+      return (await persistence?.stat?.(REVIEWER_PARENT_SESSION))?.header
+    } catch {
+      return undefined
+    }
+  }
+
+  /**
+   * Whether a stored review-parent session already carries the exact creation
+   * configuration this call asks for. Any difference (visibility, preset, or
+   * working directory) means the stored session cannot be reused as-is.
+   *
+   * @param h - the stored session header.
+   * @param visible - whether the parent must show in the session list.
+   * @param presetId - the reviewer preset the parent must run.
+   * @param cwd - the parent's working directory.
+   * @returns `true` when resuming the stored session reproduces this config.
+   */
+  function parentConfigMatches(
+    h: SessionHeader,
+    visible: boolean,
+    presetId: string,
+    cwd: string,
+  ): boolean {
+    return (h.origin === 'subagent') === !visible
+      && h.agentPreset === presetId
+      && h.cwd === cwd
   }
 
   // Cached reviewer parent: the handle owns `dispose` (the registry returns a
@@ -370,9 +419,13 @@ export function apply(ctx: Context, config: ApprovalConfig): void {
    * subagent sessions, the parent must be a normal, non-blank session so it
    * shows in the session list as the entry point to inspect those subagents.
    * When the caller deletes them, the parent stays an `origin: 'subagent'`,
-   * blank session that remains hidden (the current behaviour). A visibility
-   * flip discards the old agent and recreates it under the same stable id —
-   * safe because its own session is empty (never persisted).
+   * blank session that remains hidden (the current behaviour).
+   *
+   * The parent is a singleton under a fixed id, reused across calls and across
+   * restarts: a stored session carrying this exact configuration is resumed,
+   * never recreated. Only a MISSING session is created, and a stored session
+   * whose configuration no longer matches is discarded first — the parent never
+   * runs a turn, so its session holds no history worth keeping.
    */
   function ensureReviewerParent(presetId: string, visible: boolean): Promise<Agent> {
     if (reviewerParent !== undefined && reviewerParent.visible === visible) {
@@ -382,9 +435,10 @@ export function apply(ctx: Context, config: ApprovalConfig): void {
     reviewerParentPending = (async () => {
       const agents = ctx.get('agents') as unknown as {
         create: (opts: Record<string, unknown>) => Promise<{ agent: Agent; dispose: () => Promise<void> }>
+        resume: (opts: Record<string, unknown>) => Promise<{ agent: Agent; dispose: () => Promise<void> }>
       }
-      // Rebuild: tear down the previous agent (its session is empty, so no
-      // history is lost), then create a fresh one under the same id.
+      // Rebuild in-process: tear down the previous agent (its session is empty,
+      // so no history is lost), then reuse or recreate the singleton below.
       if (reviewerParent !== undefined) {
         const wasVisible = reviewerParent.visible
         const old = reviewerParent
@@ -400,26 +454,49 @@ export function apply(ctx: Context, config: ApprovalConfig): void {
           await cleanupReviewerSessions()
         }
       }
+      // Shared creation/resume composition: mount the reviewer preset.
+      const setup = async (agentCtx: Context): Promise<void> => {
+        const presets = agentCtx.get('agentPresets') as {
+          mount: (ctx: Context, id: string) => Promise<unknown>
+        }
+        await presets.mount(agentCtx, presetId)
+      }
+
+      // A fixed session id can be created only once: a stored log makes
+      // `create` throw `SessionAlreadyExistsError` (which would silently fall
+      // back to the main agent as the review parent). So inspect the stored
+      // parent first: reuse it when it already carries this configuration,
+      // discard it first when the configuration differs, and create only when
+      // nothing is stored.
+      let stored = await storedReviewerParentHeader()
+      if (stored !== undefined && !parentConfigMatches(stored, visible, presetId, reviewerWorkspaceDir)) {
+        // Stale config (visibility flip, preset change, or moved workspace):
+        // the parent's session is empty, so discarding it loses no history.
+        await removeReviewerSession(ctx, stored)
+        stored = undefined
+      }
+
       let handle: { agent: Agent; dispose: () => Promise<void> }
       try {
-        handle = await agents.create({
-          sessionId: REVIEWER_PARENT_SESSION,
-          meta: {
-            cwd: reviewerWorkspaceDir,
-            agentPreset: presetId,
-            ...(visible ? {} : { origin: 'subagent' }),
-          },
-          seed: visible ? emptyTurnSeed() : undefined,
-          agentOptions: {},
-          setup: async (agentCtx: Context) => {
-            const presets = agentCtx.get('agentPresets') as {
-              mount: (ctx: Context, id: string) => Promise<unknown>
-            }
-            await presets.mount(agentCtx, presetId)
-          },
-        })
+        handle = stored !== undefined
+          ? await agents.resume({
+              resumeSessionId: REVIEWER_PARENT_SESSION,
+              agentOptions: {},
+              setup,
+            })
+          : await agents.create({
+              sessionId: REVIEWER_PARENT_SESSION,
+              meta: {
+                cwd: reviewerWorkspaceDir,
+                agentPreset: presetId,
+                ...(visible ? {} : { origin: 'subagent' }),
+              },
+              seed: visible ? emptyTurnSeed() : undefined,
+              agentOptions: {},
+              setup,
+            })
       } catch (error) {
-        console.error('[dsh-safe-tool][ensureReviewerParent] agents.create FAILED:', error)
+        console.error('[dsh-safe-tool][ensureReviewerParent] parent agent FAILED:', error)
         throw error
       }
 //      console.log('[dsh-safe-tool][ensureReviewerParent] created ok, agent.session.id =', handle.agent.session.id, 'cwd =', handle.agent.session?.header?.cwd, 'presetId =', presetId, 'visible =', visible)

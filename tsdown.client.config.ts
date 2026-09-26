@@ -38,12 +38,13 @@ export default defineConfig({
   external: [
     'react',
     'react-dom',
+    'react-dom/client',
     'react/jsx-runtime',
-    '@deepseek-ai/dsh-client-runtime',
+    '@deepseek-ai/cordis',
+    '@deepseek-ai/dsh-client-store',
     '@deepseek-ai/dsh-client-ui-primitives',
     '@deepseek-ai/dsh-client-ui-slots',
-    '@deepseek-ai/dsh-client-locale',
-    'clsx',
+    '@deepseek-ai/dsh-client-ui-dockkit',
   ],
   // 使用 renderChunk 钩子手动包装，确保 module 和 exports 正确定义
   plugins: [
