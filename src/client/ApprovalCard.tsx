@@ -1,37 +1,28 @@
-/** Web UI settings card component for the AI approval plugin. */
+/**
+ * Web UI settings card for the AI approval plugin, rendered inside the
+ * Plugins page through the `plugins.row.config` slot (dsh 0.2.x).
+ *
+ * - `view: 'summary'` renders the row's one-liner description.
+ * - `view: 'page'` renders the full editor. Values and writes come from the
+ *   page owner's `ConfigPageForm` face - DATA (`{ state: ConfigFormSnapshot,
+ *   mutate }`), materialized once per page render, NOT a subscribable
+ *   `ConfigForm`. The page owner re-dispatches this entry with a fresh
+ *   `state` when the underlying view changes, so this card must never call
+ *   `subscribe`/`getSnapshot` on it - doing so throws and the slot owner
+ *   abdicates the entry (the card silently disappears).
+ * - Per-session tally management still rides the plugin's own bridge. The
+ *   tallies live in this plugin's own settings document (the entry that also
+ *   holds the config), written by the Host half through `settings.mutate`.
+ */
 
-import { useState, useCallback, useEffect } from 'react'
-
-const NS = 'dsh-safe-tool'
-const BRIDGE_PREFIX = '/api/dsh-safe-tool-settings'
-
-const CSS = {
-  card: 'dshst-card',
-  cardOpen: 'dshst-cardOpen',
-  header: 'dshst-header',
-  headText: 'dshst-headText',
-  name: 'dshst-name',
-  description: 'dshst-description',
-  pending: 'dshst-pending',
-  chevron: 'dshst-chevron',
-  chevronOpen: 'dshst-chevronOpen',
-  body: 'dshst-body',
-  footer: 'dshst-footer',
-  footerRight: 'dshst-footerRight',
-  failed: 'dshst-failed',
-  field: 'dshst-field',
-  label: 'dshst-label',
-  select: 'dshst-select',
-  input: 'dshst-input',
-  textarea: 'dshst-input',
-  hint: 'dshst-hint',
-  btn: 'dshst-btn',
-  save: 'dshst-save',
-  discard: 'dshst-discard',
-}
+import { useState, useCallback, useEffect, useRef, useSyncExternalStore, type ReactNode } from 'react'
+import type { ConfigPageForm } from '@deepseek-ai/dsh-client-ui-plugin-manager/client'
+import type { SettingsPathOpView } from '@deepseek-ai/dsh-api-remotes/client'
+import type { SnapshotStore } from './store.ts'
+import type { ApprovalStats } from './HeaderButton.tsx'
 
 /** Client-side view of the plugin config (arrays flattened to editable strings). */
-interface ApprovalConfig {
+interface ApprovalConfigView {
   enabled: boolean
   provider: string
   model: string
@@ -48,43 +39,133 @@ interface ApprovalConfig {
 /** Join a string array (if present) or return the fallback. */
 function joinArray(value: unknown, fallback: string): string {
   if (Array.isArray(value)) return value.join(', ')
-  return value ?? fallback
+  return typeof value === 'string' ? value : fallback
 }
 
-export function ApprovalCard() {
-  const [state, setState] = useState<{
-    status: 'loading' | 'ready' | 'error'
-    config: ApprovalConfig | null
-    dirty: boolean
-    saving: boolean
-    failed: boolean
-  }>({
-    status: 'loading',
-    config: null,
-    dirty: false,
-    saving: false,
-    failed: false,
-  })
-  const [open, setOpen] = useState(false)
+/** Decode the Host-resolved section into the editable view (defaults kept). */
+function decodeConfig(value: Record<string, unknown> | undefined): ApprovalConfigView {
+  return {
+    enabled: value?.enabled !== false,
+    provider: typeof value?.provider === 'string' ? value.provider : '',
+    model: typeof value?.model === 'string' ? value.model : '',
+    maxTokens: typeof value?.maxTokens === 'number' ? value.maxTokens : 2048,
+    timeoutMs: typeof value?.timeoutMs === 'number' ? value.timeoutMs : 30000,
+    humanTimeoutMs: typeof value?.humanTimeoutMs === 'number' ? value.humanTimeoutMs : 30000,
+    filterMode: value?.filterMode === 'allow-list' ? 'allow-list' : 'deny-list',
+    tools: joinArray(value?.tools, 'bash, write'),
+    autoAllowPatterns: joinArray(value?.autoAllowPatterns, ''),
+    deleteReviewerSessions: value?.deleteReviewerSessions !== false,
+    reviewerPreset: typeof value?.reviewerPreset === 'string' && value.reviewerPreset !== ''
+      ? value.reviewerPreset
+      : 'minimal',
+  }
+}
 
-  // Stats storage management state: the per-session tallies kept in the stats
-  // settings namespace, plus which rows the user has selected for clearing.
+/** Turn the editable view back into revision-fenced path ops. */
+function configToOps(c: ApprovalConfigView): SettingsPathOpView[] {
+  return [
+    { op: 'set', path: ['enabled'], value: c.enabled },
+    c.provider === '' ? { op: 'unset' as const, path: ['provider'] } : { op: 'set' as const, path: ['provider'], value: c.provider },
+    c.model === '' ? { op: 'unset' as const, path: ['model'] } : { op: 'set' as const, path: ['model'], value: c.model },
+    { op: 'set', path: ['maxTokens'], value: c.maxTokens },
+    { op: 'set', path: ['timeoutMs'], value: c.timeoutMs },
+    { op: 'set', path: ['humanTimeoutMs'], value: c.humanTimeoutMs },
+    { op: 'set', path: ['filterMode'], value: c.filterMode },
+    { op: 'set', path: ['tools'], value: c.tools.split(',').map(s => s.trim()).filter(s => s.length > 0) },
+    { op: 'set', path: ['autoAllowPatterns'], value: c.autoAllowPatterns.split('\n').map(s => s.trim()).filter(s => s.length > 0) },
+    { op: 'set', path: ['deleteReviewerSessions'], value: c.deleteReviewerSessions },
+    c.reviewerPreset === '' ? { op: 'unset' as const, path: ['reviewerPreset'] } : { op: 'set' as const, path: ['reviewerPreset'], value: c.reviewerPreset },
+  ]
+}
+
+/** Owner props of the `plugins.row.config` slot (subset the card consumes). */
+export interface ApprovalCardProps {
+  /** Translate this bundle's locale keys (bound by the Client locale service). */
+  t: (key: string) => string
+  view: 'summary' | 'page'
+  form: ConfigPageForm | undefined
+  /** Stats bridge face for the tally manager. */
+  stats: {
+    fetchStats: () => Promise<Record<string, ApprovalStats>>
+    /** Shared "unsaved" flag (the row summary and the editor are two mounts). */
+    unsaved: SnapshotStore<boolean>
+  }
+}
+
+const CSS = {
+  card: 'dshst-card',
+  body: 'dshst-body',
+  footer: 'dshst-footer',
+  footerRight: 'dshst-footerRight',
+  failed: 'dshst-failed',
+  field: 'dshst-field',
+  label: 'dshst-label',
+  select: 'dshst-select',
+  input: 'dshst-input',
+  textarea: 'dshst-input',
+  hint: 'dshst-hint',
+  btn: 'dshst-btn',
+  save: 'dshst-save',
+  discard: 'dshst-discard',
+  summary: 'dshst-summary',
+  pending: 'dshst-pending',
+}
+
+/** Whether two decoded views carry the same editable values. */
+function sameView(a: ApprovalConfigView, b: ApprovalConfigView): boolean {
+  return a.enabled === b.enabled
+    && a.provider === b.provider
+    && a.model === b.model
+    && a.maxTokens === b.maxTokens
+    && a.timeoutMs === b.timeoutMs
+    && a.humanTimeoutMs === b.humanTimeoutMs
+    && a.filterMode === b.filterMode
+    && a.tools === b.tools
+    && a.autoAllowPatterns === b.autoAllowPatterns
+    && a.deleteReviewerSessions === b.deleteReviewerSessions
+    && a.reviewerPreset === b.reviewerPreset
+}
+
+/**
+ * The one-liner the Plugins page renders as the row's description fallback.
+ */
+export function ApprovalCardSummary({ t, unsaved }: { t: (key: string) => string; unsaved?: boolean }): ReactNode {
+  return (
+    <span className={CSS.summary}>
+      {t('t55')}
+      {unsaved === true ? <span className={CSS.pending}>{t('t1')}</span> : null}
+    </span>
+  )
+}
+
+export function ApprovalCard({ t, view, form, stats }: ApprovalCardProps): ReactNode {
+  const [dirty, setDirty] = useState(false)
+  const [saving, setSaving] = useState(false)
+  const [failed, setFailed] = useState(false)
+  const [draft, setDraft] = useState<ApprovalConfigView | null>(null)
+
+  // Mirror the dirty flag into the shared store so the row summary can show the
+  // t('t1') marker that 0.1.x rendered in its own header.
+  const unsaved = useSyncExternalStore(
+    useCallback((listener: () => void) => stats.unsaved.subscribe(listener), [stats]),
+    () => stats.unsaved.getSnapshot(),
+    () => stats.unsaved.getSnapshot(),
+  )
+
+  // Stats management state: the per-session tallies the Host keeps in this
+  // plugin's settings document, plus which rows the user selected for clearing.
   const [statsState, setStatsState] = useState<{
-    sessions: Record<string, { total: number; approved: number; denied: number; errorDenied: number }>
+    sessions: Record<string, ApprovalStats>
     loading: boolean
     selected: Record<string, boolean>
-  }>({
-    sessions: {},
-    loading: true,
-    selected: {},
-  })
+  }>({ sessions: {}, loading: true, selected: {} })
 
   // Available agent presets for the review subagent's dedicated parent.
   const [presets, setPresets] = useState<Array<{ id: string; name: string; description: string }>>([])
 
   const loadPresets = useCallback(async () => {
     try {
-      const response = await fetch(`${BRIDGE_PREFIX}/list-presets`, {
+      const response = await fetch('/api/dsh-safe-tool-settings/list-presets', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: '{}',
@@ -100,30 +181,20 @@ export function ApprovalCard() {
 
   const loadStats = useCallback(async () => {
     try {
-      const response = await fetch(`${BRIDGE_PREFIX}/stats-list`, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: '{}',
-      })
-      const result = await response.json()
-      if (result.ok) {
-        setStatsState(s => ({ ...s, sessions: result.sessions ?? {}, loading: false }))
-      } else {
-        setStatsState(s => ({ ...s, loading: false }))
-      }
+      const sessions = await stats.fetchStats()
+      setStatsState(s => ({ ...s, sessions, loading: false }))
     } catch {
       setStatsState(s => ({ ...s, loading: false }))
     }
-  }, [])
+  }, [stats])
 
   const clearStats = useCallback(async (sessionIds?: string[]) => {
     try {
-      await fetch(`${BRIDGE_PREFIX}/stats-clear`, {
+      await fetch('/api/dsh-safe-tool-settings/stats-clear', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify(sessionIds === undefined ? {} : { sessionIds }),
       })
-      // Refresh after clearing.
       await loadStats()
       if (sessionIds === undefined) setStatsState(s => ({ ...s, selected: {} }))
     } catch {
@@ -138,363 +209,326 @@ export function ApprovalCard() {
     }))
   }, [])
 
-  const load = useCallback(async () => {
-    try {
-      const response = await fetch(`${BRIDGE_PREFIX}/describe`, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: '{}',
-      })
-      const result = await response.json()
-      if (result.ok && result.value) {
-        const v = result.value.value ?? result.value
-        setState({
-          status: 'ready',
-          config: {
-            enabled: v.enabled ?? true,
-            provider: v.provider ?? '',
-            model: v.model ?? '',
-            maxTokens: v.maxTokens ?? 2048,
-            timeoutMs: v.timeoutMs ?? 30000,
-            humanTimeoutMs: v.humanTimeoutMs ?? 30000,
-            filterMode: v.filterMode ?? 'deny-list',
-            tools: joinArray(v.tools, 'bash, write'),
-            autoAllowPatterns: joinArray(v.autoAllowPatterns, ''),
-            deleteReviewerSessions: v.deleteReviewerSessions ?? true,
-            reviewerPreset: v.reviewerPreset ?? 'minimal',
-          },
-          dirty: false,
-          saving: false,
-          failed: false,
-        })
-      } else {
-        setState(s => ({ ...s, status: 'error' }))
-      }
-    } catch {
-      setState(s => ({ ...s, status: 'error' }))
-    }
-  }, [])
+  // The page owner re-dispatches this entry with a fresh `form.state` object
+  // whenever the underlying Host view changes; re-sync the draft from it
+  // (unless the user has unsaved local edits). NEVER subscribe to this face:
+  // it is data, not a store.
+  const snapshot = form?.state
+
+  // The summary mount renders a static one-liner: it must not drive bridge
+  // traffic (the page mounts both views for the same row).
+  const isSummary = view === 'summary'
+  useEffect(() => {
+    if (isSummary) return
+    stats.unsaved.set(dirty)
+  }, [isSummary, dirty, stats])
+
+  // Load the bridge data EXACTLY once per mount. The ref guard is a
+  // structural safety net: even if a future edit gives `loadStats`/`loadPresets`
+  // an unstable identity, this effect cannot re-run and cannot storm the Host.
+  const bridgeLoaded = useRef(false)
+  useEffect(() => {
+    if (isSummary) return
+    if (bridgeLoaded.current) return
+    bridgeLoaded.current = true
+    void loadStats()
+    void loadPresets()
+  }, [isSummary, loadStats, loadPresets])
 
   useEffect(() => {
-    load()
-    loadStats()
-    loadPresets()
-  }, [load, loadStats, loadPresets])
+    if (dirty) return
+    if (snapshot?.status === 'ready') {
+      const next = decodeConfig(snapshot.value)
+      // Re-setting an equal draft would schedule a pointless render; the page
+      // owner re-dispatches with a fresh object on every Host view change.
+      setDraft(prev => (prev !== null && sameView(prev, next) ? prev : next))
+    } else {
+      setDraft(prev => (prev === null ? prev : null))
+    }
+  }, [snapshot, dirty])
 
-  const update = useCallback((key: keyof ApprovalConfig, value: unknown) => {
-    setState(s => ({
-      ...s,
-      config: s.config ? { ...s.config, [key]: value } : null,
-      dirty: true,
-      failed: false,
-    }))
+  const update = useCallback((key: keyof ApprovalConfigView, value: unknown) => {
+    setDraft(d => (d ? { ...d, [key]: value } : d))
+    setDirty(true)
+    setFailed(false)
   }, [])
 
   const save = useCallback(async () => {
-    if (!state.config || !state.dirty) return
-    const c = state.config
-    setState(s => ({ ...s, saving: true, failed: false }))
+    if (!form || !draft || !dirty) return
+    setSaving(true)
+    setFailed(false)
     try {
-      const response = await fetch(`${BRIDGE_PREFIX}/mutate`, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({
-          ns: NS,
-          ops: [
-            { op: 'set', path: ['enabled'], value: c.enabled },
-            { op: 'set', path: ['provider'], value: c.provider === '' ? null : c.provider },
-            { op: 'set', path: ['model'], value: c.model === '' ? null : c.model },
-            { op: 'set', path: ['maxTokens'], value: c.maxTokens },
-            { op: 'set', path: ['timeoutMs'], value: c.timeoutMs },
-            { op: 'set', path: ['humanTimeoutMs'], value: c.humanTimeoutMs },
-            { op: 'set', path: ['filterMode'], value: c.filterMode },
-            { op: 'set', path: ['tools'], value: c.tools.split(',').map(s => s.trim()).filter(s => s.length > 0) },
-            { op: 'set', path: ['autoAllowPatterns'], value: c.autoAllowPatterns.split('\n').map(s => s.trim()).filter(s => s.length > 0) },
-            { op: 'set', path: ['deleteReviewerSessions'], value: c.deleteReviewerSessions },
-            { op: 'set', path: ['reviewerPreset'], value: c.reviewerPreset === '' ? null : c.reviewerPreset },
-          ],
-        }),
-      })
-      const result = await response.json()
-      if (result.ok) {
-        setState(s => ({ ...s, dirty: false, saving: false }))
+      // No expected revision: the plugin writes a tally into this same entry's
+      // document, so a revision captured at render time can already be stale.
+      // The form controller resolves the current revision itself.
+      const ok = await form.mutate(configToOps(draft))
+      if (ok) {
+        setDirty(false)
       } else {
-        setState(s => ({ ...s, saving: false, failed: true }))
+        setFailed(true)
       }
     } catch {
-      setState(s => ({ ...s, saving: false, failed: true }))
+      setFailed(true)
+    } finally {
+      setSaving(false)
     }
-  }, [state.config, state.dirty])
+  }, [form, draft, dirty])
 
   const discard = useCallback(() => {
-    load()
-  }, [load])
+    if (snapshot?.status === 'ready') setDraft(decodeConfig(snapshot.value))
+    setDirty(false)
+    setFailed(false)
+  }, [snapshot])
 
-  if (state.status === 'loading') {
+  if (view === 'summary') {
+    return <ApprovalCardSummary t={t} unsaved={unsaved} />
+  }
+
+  if (form === undefined || snapshot === undefined || snapshot.status !== 'ready' || draft === null) {
     return (
-      <li className={CSS.card}>
-        <div className={CSS.header}>
-          <span className={CSS.headText}>
-            <span className={CSS.name}>AI 工具执行审批</span>
-            <span className={CSS.description}>加载设置中...</span>
-          </span>
-        </div>
-      </li>
+      <div className={CSS.card} style={{ padding: '12px 14px' }}>
+        {/* Visible wording matches 0.1.x; the Host-side reason stays available
+            as a tooltip so a broken settings surface is still diagnosable. */}
+        <p
+          className={CSS.hint}
+          title={form === undefined
+            ? t('t2')
+            : snapshot?.status === 'unavailable'
+              ? t('t3')
+              : undefined}
+        >
+          {form === undefined || snapshot?.status === 'unavailable'
+            ? t('t4')
+            : t('t5')}
+        </p>
+      </div>
     )
   }
 
-  if (state.status === 'error' || !state.config) {
-    return (
-      <li className={CSS.card}>
-        <div className={CSS.header}>
-          <span className={CSS.headText}>
-            <span className={CSS.name}>AI 工具执行审批</span>
-            <span className={CSS.description}>设置不可用</span>
-          </span>
-        </div>
-      </li>
-    )
-  }
-
-  const c = state.config
+  const c = draft
+  const writable = snapshot.writable
 
   return (
-    <li className={`${CSS.card} ${open ? CSS.cardOpen : ''}`}>
-      <button
-        type="button"
-        className={CSS.header}
-        onClick={() => setOpen(!open)}
-        aria-expanded={open}
-      >
-        <span className={CSS.headText}>
-          <span className={CSS.name}>AI 工具执行审批</span>
-          <span className={CSS.description}>拦截工具调用，由 AI 子代理审查是否安全可执行</span>
-        </span>
-        {state.dirty ? <span className={CSS.pending}>未保存</span> : null}
-        <svg className={`${CSS.chevron} ${open ? CSS.chevronOpen : ''}`} width="16" height="16" viewBox="0 0 16 16" fill="currentColor">
-          <path d="M4.5 6l3.5 4 3.5-4H4.5z"/>
-        </svg>
-      </button>
-      {open ? (
-        <div className={CSS.body}>
-          <div className={CSS.field}>
-            <label className={CSS.label}>启用审批插件</label>
-            <div>
-              <button
-                type="button"
-                className={`${CSS.btn} ${c.enabled ? CSS.save : CSS.discard}`}
-                onClick={() => update('enabled', !c.enabled)}
-              >
-                {c.enabled ? '已启用' : '已禁用'}
-              </button>
-            </div>
-            <p className={CSS.hint}>关闭后所有工具调用直接生效，不再审批（实时生效，无需重启）</p>
-          </div>
-
-          <div className={CSS.field}>
-            <label className={CSS.label}>删除审批子代理会话记录</label>
-            <div>
-              <button
-                type="button"
-                className={`${CSS.btn} ${c.deleteReviewerSessions ? CSS.save : CSS.discard}`}
-                onClick={() => update('deleteReviewerSessions', !c.deleteReviewerSessions)}
-              >
-                {c.deleteReviewerSessions ? '开启' : '关闭'}
-              </button>
-            </div>
-            <p className={CSS.hint}>
-              {c.deleteReviewerSessions
-                ? '每次审批结束后，从磁盘删除审批子代理的会话记录，不留审批痕迹'
-                : '保留审批子代理的会话记录，便于事后回溯审批过程'}
-            </p>
-          </div>
-
-          <div className={CSS.field}>
-            <label className={CSS.label}>审批预设（reviewer preset）</label>
-            <select
-              className={CSS.select}
-              value={c.reviewerPreset}
-              onChange={(e) => update('reviewerPreset', e.target.value)}
+    <div className={CSS.card}>
+      <div className={CSS.body}>
+        <div className={CSS.field}>
+          <label className={CSS.label}>{t('t18')}</label>
+          <div>
+            <button
+              type="button"
+              className={`${CSS.btn} ${c.enabled ? CSS.save : CSS.discard}`}
+              disabled={!writable}
+              onClick={() => update('enabled', !c.enabled)}
             >
-              {!presets.some(p => p.id === c.reviewerPreset) ? (
-                <option value={c.reviewerPreset}>{c.reviewerPreset}</option>
-              ) : null}
-              {presets.map(p => (
-                <option key={p.id} value={p.id}>{p.name}</option>
-              ))}
-            </select>
-            <p className={CSS.hint}>
-              审批子代理继承专属 agent 挂载的预设（默认 minimal 极简模式），与主代理预设无关；更改需重启生效
-            </p>
+              {c.enabled ? t('t6') : t('t7')}
+            </button>
           </div>
+          <p className={CSS.hint}>{t('t19')}</p>
+        </div>
 
-          <div className={CSS.field}>
-            <label className={CSS.label}>审核模型提供者（provider）</label>
-            <input
-              type="text"
-              className={CSS.input}
-              placeholder="留空 = 继承主代理的 provider"
-              value={c.provider}
-              onChange={(e) => update('provider', e.target.value)}
-            />
-            <p className={CSS.hint}>留空则继承主代理的 provider</p>
-          </div>
-
-          <div className={CSS.field}>
-            <label className={CSS.label}>审核模型（model）</label>
-            <input
-              type="text"
-              className={CSS.input}
-              placeholder="留空 = 继承主代理的 model"
-              value={c.model}
-              onChange={(e) => update('model', e.target.value)}
-            />
-            <p className={CSS.hint}>留空则继承主代理的 model</p>
-          </div>
-
-          <div className={CSS.field}>
-            <label className={CSS.label}>最大输出 token（maxTokens）</label>
-            <input
-              type="number"
-              className={CSS.input}
-              value={c.maxTokens}
-              onChange={(e) => update('maxTokens', Number(e.target.value))}
-            />
-          </div>
-
-          <div className={CSS.field}>
-            <label className={CSS.label}>审核超时（毫秒）</label>
-            <input
-              type="number"
-              className={CSS.input}
-              value={c.timeoutMs}
-              onChange={(e) => update('timeoutMs', Number(e.target.value))}
-            />
-            <p className={CSS.hint}>子代理审核的最大等待时间</p>
-          </div>
-
-          <div className={CSS.field}>
-            <label className={CSS.label}>人工审批超时（毫秒）</label>
-            <input
-              type="number"
-              className={CSS.input}
-              value={c.humanTimeoutMs}
-              onChange={(e) => update('humanTimeoutMs', Number(e.target.value))}
-            />
-            <p className={CSS.hint}>AI 无法判断时回退人工审批的等待时间</p>
-          </div>
-
-          <div className={CSS.field}>
-            <label className={CSS.label}>拦截模式</label>
-            <select
-              className={CSS.select}
-              value={c.filterMode}
-              onChange={(e) => update('filterMode', e.target.value as 'deny-list' | 'allow-list')}
+        <div className={CSS.field}>
+          <label className={CSS.label}>{t('t20')}</label>
+          <div>
+            <button
+              type="button"
+              className={`${CSS.btn} ${c.deleteReviewerSessions ? CSS.save : CSS.discard}`}
+              disabled={!writable}
+              onClick={() => update('deleteReviewerSessions', !c.deleteReviewerSessions)}
             >
-              <option value="deny-list">deny-list（黑名单：拦截列表中的工具）</option>
-              <option value="allow-list">allow-list（白名单：仅放行列表中的工具）</option>
-            </select>
-            <p className={CSS.hint}>
-              {c.filterMode === 'deny-list'
-                ? 'deny-list：列表中列出的工具会被拦截审批，其余直接放行'
-                : 'allow-list：仅列表中列出的工具会被拦截审批，其余直接放行'}
-            </p>
+              {c.deleteReviewerSessions ? t('t8') : t('t9')}
+            </button>
           </div>
+          <p className={CSS.hint}>
+            {c.deleteReviewerSessions
+              ? t('t10')
+              : t('t11')}
+          </p>
+        </div>
 
-          <div className={CSS.field}>
-            <label className={CSS.label}>工具列表</label>
-            <input
-              type="text"
-              className={CSS.input}
-              value={c.tools}
-              onChange={(e) => update('tools', e.target.value)}
-            />
-            <p className={CSS.hint}>逗号分隔的工具名称，如 bash, write</p>
-          </div>
+        <div className={CSS.field}>
+          <label className={CSS.label}>{t('t21')}</label>
+          <select
+            className={CSS.select}
+            value={c.reviewerPreset}
+            disabled={!writable}
+            onChange={(e) => update('reviewerPreset', e.target.value)}
+          >
+            {!presets.some(p => p.id === c.reviewerPreset) ? (
+              <option value={c.reviewerPreset}>{c.reviewerPreset}</option>
+            ) : null}
+            {presets.map(p => (
+              <option key={p.id} value={p.id}>{p.name}</option>
+            ))}
+          </select>
+          <p className={CSS.hint}>{t('t22')}</p>
+        </div>
 
-          <div className={CSS.field}>
-            <label className={CSS.label}>自动放行正则（每行一个）</label>
-            <textarea
-              className={CSS.textarea}
-              rows={3}
-              value={c.autoAllowPatterns}
-              onChange={(e) => update('autoAllowPatterns', e.target.value)}
-            />
-            <p className={CSS.hint}>匹配工具参数 JSON 的正则，命中则跳过审批直接放行</p>
-          </div>
+        <div className={CSS.field}>
+          <label className={CSS.label}>{t('t23')}</label>
+          <input
+            type="text"
+            className={CSS.input}
+            placeholder={t('t12')}
+            value={c.provider}
+            disabled={!writable}
+            onChange={(e) => update('provider', e.target.value)}
+          />
+          <p className={CSS.hint}>{t('t24')}</p>
+        </div>
 
-          <div className={CSS.field}>
-            <label className={CSS.label}>审批统计存储</label>
-            {statsState.loading ? (
-              <p className={CSS.hint}>加载中...</p>
-            ) : Object.keys(statsState.sessions).length === 0 ? (
-              <p className={CSS.hint}>暂无统计记录</p>
-            ) : (
-              <>
-                <div style={{ display: 'flex', flexDirection: 'column', gap: '4px', maxHeight: '180px', overflowY: 'auto' }}>
-                  {Object.entries(statsState.sessions).map(([sessionId, stat]) => (
-                    <label key={sessionId} style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '12px', color: 'var(--dsw-alias-label-primary)' }}>
-                      <input
-                        type="checkbox"
-                        checked={!!statsState.selected[sessionId]}
-                        onChange={() => toggleSelect(sessionId)}
-                      />
-                      <span style={{ fontFamily: 'monospace' }}>{sessionId.slice(0, 8)}…</span>
-                      <span style={{ flex: 1, color: 'var(--dsw-alias-label-secondary)' }}>总计 {stat.total}</span>
-                      <button
-                        type="button"
-                        className={CSS.discard}
-                        onClick={() => void clearStats([sessionId])}
-                      >
-                        清理
-                      </button>
-                    </label>
-                  ))}
-                </div>
-                <div className={CSS.footerRight} style={{ marginTop: '6px' }}>
-                  <button
-                    type="button"
-                    className={CSS.discard}
-                    disabled={!Object.values(statsState.selected).some(Boolean)}
-                    onClick={() => void clearStats(Object.keys(statsState.selected).filter(id => statsState.selected[id]))}
-                  >
-                    清理选中
-                  </button>
-                  <button
-                    type="button"
-                    className={CSS.discard}
-                    onClick={() => void clearStats(undefined)}
-                  >
-                    一键清理全部
-                  </button>
-                </div>
-              </>
-            )}
-          </div>
+        <div className={CSS.field}>
+          <label className={CSS.label}>{t('t25')}</label>
+          <input
+            type="text"
+            className={CSS.input}
+            placeholder={t('t13')}
+            value={c.model}
+            disabled={!writable}
+            onChange={(e) => update('model', e.target.value)}
+          />
+          <p className={CSS.hint}>{t('t26')}</p>
+        </div>
 
-          <div className={CSS.footer}>
-            {state.failed ? <span className={CSS.failed}>保存失败，请重试</span> : null}
-            <div className={CSS.footerRight}>
-              <button
-                type="button"
-                className={CSS.discard}
-                disabled={!state.dirty || state.saving}
-                onClick={discard}
-              >
-                放弃
-              </button>
-              <button
-                type="button"
-                className={CSS.save}
-                disabled={!state.dirty || state.saving}
-                onClick={save}
-              >
-                {state.saving ? '保存中…' : '保存'}
-              </button>
-            </div>
+        <div className={CSS.field}>
+          <label className={CSS.label}>{t('t27')}</label>
+          <input
+            type="number"
+            className={CSS.input}
+            value={c.maxTokens}
+            disabled={!writable}
+            onChange={(e) => update('maxTokens', Number(e.target.value))}
+          />
+        </div>
+
+        <div className={CSS.field}>
+          <label className={CSS.label}>{t('t28')}</label>
+          <input
+            type="number"
+            className={CSS.input}
+            value={c.timeoutMs}
+            disabled={!writable}
+            onChange={(e) => update('timeoutMs', Number(e.target.value))}
+          />
+          <p className={CSS.hint}>{t('t29')}</p>
+        </div>
+
+        <div className={CSS.field}>
+          <label className={CSS.label}>{t('t30')}</label>
+          <input
+            type="number"
+            className={CSS.input}
+            value={c.humanTimeoutMs}
+            disabled={!writable}
+            onChange={(e) => update('humanTimeoutMs', Number(e.target.value))}
+          />
+          <p className={CSS.hint}>{t('t31')}</p>
+        </div>
+
+        <div className={CSS.field}>
+          <label className={CSS.label}>{t('t32')}</label>
+          <select
+            className={CSS.select}
+            value={c.filterMode}
+            disabled={!writable}
+            onChange={(e) => update('filterMode', e.target.value as 'deny-list' | 'allow-list')}
+          >
+            <option value="deny-list">{t('t33')}</option>
+            <option value="allow-list">{t('t34')}</option>
+          </select>
+          <p className={CSS.hint}>
+            {c.filterMode === 'deny-list'
+              ? t('t14')
+              : t('t15')}
+          </p>
+        </div>
+
+        <div className={CSS.field}>
+          <label className={CSS.label}>{t('t35')}</label>
+          <input
+            type="text"
+            className={CSS.input}
+            value={c.tools}
+            disabled={!writable}
+            onChange={(e) => update('tools', e.target.value)}
+          />
+          <p className={CSS.hint}>{t('t36')}</p>
+        </div>
+
+        <div className={CSS.field}>
+          <label className={CSS.label}>{t('t37')}</label>
+          <textarea
+            className={CSS.textarea}
+            rows={3}
+            value={c.autoAllowPatterns}
+            disabled={!writable}
+            onChange={(e) => update('autoAllowPatterns', e.target.value)}
+          />
+          <p className={CSS.hint}>{t('t38')}</p>
+        </div>
+
+        <div className={CSS.field}>
+          <label className={CSS.label}>{t('t39')}</label>
+          {statsState.loading ? (
+            <p className={CSS.hint}>{t('t40')}</p>
+          ) : Object.keys(statsState.sessions).length === 0 ? (
+            <p className={CSS.hint}>{t('t41')}</p>
+          ) : (
+            <>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '4px', maxHeight: '180px', overflowY: 'auto' }}>
+                {Object.entries(statsState.sessions).map(([sessionId, stat]) => (
+                  <label key={sessionId} style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '12px', color: 'var(--dsw-alias-label-primary)' }}>
+                    <input
+                      type="checkbox"
+                      checked={!!statsState.selected[sessionId]}
+                      onChange={() => toggleSelect(sessionId)}
+                    />
+                    <span style={{ fontFamily: 'monospace' }}>{sessionId.slice(0, 8)}…</span>
+                    <span style={{ flex: 1, color: 'var(--dsw-alias-label-secondary)' }}>{t('t50')} {stat.total}</span>
+                    <button
+                      type="button"
+                      className={CSS.discard}
+                      onClick={() => void clearStats([sessionId])}
+                    >{t('t42')}</button>
+                  </label>
+                ))}
+              </div>
+              <div className={CSS.footerRight} style={{ marginTop: '6px' }}>
+                <button
+                  type="button"
+                  className={CSS.discard}
+                  disabled={!Object.values(statsState.selected).some(Boolean)}
+                  onClick={() => void clearStats(Object.keys(statsState.selected).filter(id => statsState.selected[id]))}
+                >{t('t43')}</button>
+                <button
+                  type="button"
+                  className={CSS.discard}
+                  onClick={() => void clearStats(undefined)}
+                >{t('t44')}</button>
+              </div>
+            </>
+          )}
+        </div>
+
+        <div className={CSS.footer}>
+          {failed ? <span className={CSS.failed}>{t('t45')}</span> : null}
+          <div className={CSS.footerRight}>
+            <button
+              type="button"
+              className={CSS.discard}
+              disabled={!dirty || saving || !writable}
+              onClick={discard}
+            >{t('t46')}</button>
+            <button
+              type="button"
+              className={CSS.save}
+              disabled={!dirty || saving || !writable}
+              onClick={() => void save()}
+            >
+              {saving ? t('t16') : t('t17')}
+            </button>
           </div>
         </div>
-      ) : null}
-    </li>
+      </div>
+    </div>
   )
 }

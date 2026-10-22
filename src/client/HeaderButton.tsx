@@ -1,22 +1,20 @@
 /**
  * AI Approval header button: a session-header action showing this session's
- * cumulative approval stats. Stats live in the host settings namespace and
- * refresh through the `settings/document-updated` WSS event, delivered here as
- * a bound `useApprovalStats` hook. The header shows one borderless stats chip;
- * the enable switch, the four counts, and the settings jump all live inside
- * the popover. All colors use the `--dsw-*` design tokens so light/dark
- * follows the active skin.
+ * cumulative approval stats. Stats are served by the plugin's own bridge and
+ * delivered here as a bound `useApprovalStats` hook. The header shows one
+ * borderless stats chip; the enable switch and the four counts live inside
+ * the popover. The switch writes through the shared `configForms` service
+ * (the 0.1.x describe/mutate bridge for config is gone in 0.2.x). All colors
+ * use the `--dsw-*` design tokens so light/dark follows the active skin.
  * @module dsh-safe-tool/client/HeaderButton
  */
 
-import { useCallback, useEffect, useState, type ReactNode } from 'react'
+import { useCallback, useState, useSyncExternalStore, type ReactNode } from 'react'
 import type { InjectFace, PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
-import type { SnapshotStore } from '@deepseek-ai/dsh-client-store'
+import type { SnapshotStore } from './store.ts'
+import type { ConfigForm } from '@deepseek-ai/dsh-client-ui-settings/client'
 
-const NS = 'dsh-safe-tool'
-const BRIDGE_PREFIX = '/api/dsh-safe-tool-settings'
-
-/** One session's cumulative approval tally, as stored in the host settings. */
+/** One session's cumulative approval tally, as the Host stores it. */
 export interface ApprovalStats {
   total: number
   approved: number
@@ -30,16 +28,16 @@ export interface ApprovalHeaderState {
   sessions: Record<string, ApprovalStats>
 }
 
-/** Registration-side injected face: the live stats store plus the enable face. */
+/** Registration-side injected face: the live stats store plus the config form. */
 export interface HeaderButtonInjected {
+  /** Translate this bundle's locale keys (bound by the Client locale service). */
+  t: (key: string) => string
   hooks: {
     /** Live per-session stats, bound by the renderer as `useApprovalStats`. */
     approvalStats: SnapshotStore<ApprovalHeaderState>
   }
-  /** Read the current enable flag. */
-  getEnabled: () => Promise<boolean>
-  /** Persist the enable/disable switch and return the settled value. */
-  setEnabled: (enabled: boolean) => Promise<boolean>
+  /** The row's config form; the enable switch writes `enabled` through it. */
+  form: ConfigForm<Record<string, unknown>>
 }
 
 /** Full component props assembled by the session-header slot renderer. */
@@ -71,39 +69,34 @@ function Row({ glyph, glyphColor, label, value, valueColor }: {
 
 /**
  * Render the header approval button with its stats popover.
- * @param props - framework kit (sessionId, useApprovalStats) and the enable face.
+ * @param props - framework kit (sessionId, useApprovalStats) and the config form.
  * @returns the header button plus its dropdown.
  */
 export function ApprovalHeaderButton({
-  sessionId, useApprovalStats, getEnabled, setEnabled,
+  t, sessionId, useApprovalStats, form,
 }: ApprovalHeaderButtonProps): ReactNode {
   const headerState = useApprovalStats(s => s)
   const [open, setOpen] = useState(false)
-  const [enabled, setEnabledState] = useState(true)
   const [pendingToggle, setPendingToggle] = useState(false)
 
-  useEffect(() => {
-    let cancelled = false
-    getEnabled().then(value => {
-      if (!cancelled) setEnabledState(value)
-    }).catch(() => {
-      // Read failed — keep the default.
-    })
-    return () => { cancelled = true }
-  }, [getEnabled])
+  // Subscribe to the shared config form so the switch reflects Host state.
+  const subscribe = useCallback((listener: () => void) => form.subscribe(listener), [form])
+  const snapshot = useSyncExternalStore(subscribe, () => form.getSnapshot(), () => form.getSnapshot())
+  const enabled = snapshot.status === 'ready' && snapshot.value !== undefined
+    ? (snapshot.value as { enabled?: boolean }).enabled !== false
+    : true
 
   const toggleEnabled = useCallback(async () => {
     if (pendingToggle) return
     setPendingToggle(true)
     try {
-      const next = await setEnabled(!enabled)
-      setEnabledState(next)
+      await form.set('enabled', !enabled)
     } catch {
       // Toggle failed — leave the switch where it was.
     } finally {
       setPendingToggle(false)
     }
-  }, [pendingToggle, enabled, setEnabled])
+  }, [pendingToggle, enabled, form])
 
   if (sessionId === undefined) return null
 
@@ -135,7 +128,7 @@ export function ApprovalHeaderButton({
           cursor: 'pointer',
           transition: 'background 0.15s ease, border-color 0.15s ease',
         }}
-        aria-label="审批统计"
+        aria-label={t('t47')}
         aria-expanded={open}
       >
         <span style={{ color: 'var(--dsw-alias-state-success-primary)', fontWeight: '600', fontVariantNumeric: 'tabular-nums' }}>{fmt(approved)}</span>
@@ -158,18 +151,18 @@ export function ApprovalHeaderButton({
               background: 'var(--dsw-alias-bg-layer-3)',
               border: '1px solid var(--dsw-alias-border-l2)',
               borderRadius: '8px',
-              boxShadow: '0 4px 16px rgba(0,0,0,0.16)',
+              boxShadow: 'var(--dsw-elevation-panel)',
               zIndex: '1000',
               overflow: 'hidden',
             }}
           >
             {/* Enable switch — same tier as the stats, inside the popover. */}
             <div style={{ display: 'flex', alignItems: 'center', gap: '8px', padding: '10px 12px', borderBottom: '1px solid var(--dsw-alias-border-l2)' }}>
-              <span style={{ flex: 1, fontSize: '12px', fontWeight: '600', color: 'var(--dsw-alias-label-primary)' }}>AI 审批</span>
+              <span style={{ flex: 1, fontSize: '12px', fontWeight: '600', color: 'var(--dsw-alias-label-primary)' }}>{t('t54')}</span>
               <button
                 type="button"
                 onClick={() => void toggleEnabled()}
-                disabled={pendingToggle}
+                disabled={pendingToggle || snapshot.status !== 'ready' || !snapshot.writable}
                 style={{
                   display: 'inline-flex',
                   alignItems: 'center',
@@ -186,19 +179,19 @@ export function ApprovalHeaderButton({
                   opacity: pendingToggle ? 0.6 : 1,
                   transition: 'background 0.15s ease, color 0.15s ease',
                 }}
-                aria-label={enabled ? '禁用 AI 审批' : '启用 AI 审批'}
+                aria-label={enabled ? t('t48') : t('t49')}
                 aria-pressed={enabled}
               >
-                {enabled ? '已启用' : '已禁用'}
+                {enabled ? t('t6') : t('t7')}
               </button>
             </div>
 
             {/* Four counts — same tier, borderless rows. */}
             <div style={{ padding: '6px 0' }}>
-              <Row glyph="📊" glyphColor="var(--dsw-alias-label-primary)" label="总计" value={total} valueColor="var(--dsw-alias-label-primary)" />
-              <Row glyph="✓" glyphColor="var(--dsw-alias-state-success-primary)" label="批准" value={approved} valueColor="var(--dsw-alias-state-success-primary)" />
-              <Row glyph="✗" glyphColor="var(--dsw-alias-state-error-primary)" label="拒绝" value={denied} valueColor="var(--dsw-alias-state-error-primary)" />
-              <Row glyph="⚠" glyphColor="var(--dsw-alias-state-warn-primary)" label="错误拒绝" value={errorDenied} valueColor="var(--dsw-alias-state-warn-primary)" />
+              <Row glyph="📊" glyphColor="var(--dsw-alias-label-primary)" label={t('t50')} value={total} valueColor="var(--dsw-alias-label-primary)" />
+              <Row glyph="✓" glyphColor="var(--dsw-alias-state-success-primary)" label={t('t51')} value={approved} valueColor="var(--dsw-alias-state-success-primary)" />
+              <Row glyph="✗" glyphColor="var(--dsw-alias-state-error-primary)" label={t('t52')} value={denied} valueColor="var(--dsw-alias-state-error-primary)" />
+              <Row glyph="⚠" glyphColor="var(--dsw-alias-state-warn-primary)" label={t('t53')} value={errorDenied} valueColor="var(--dsw-alias-state-warn-primary)" />
             </div>
           </div>
         </>
@@ -206,7 +199,3 @@ export function ApprovalHeaderButton({
     </div>
   )
 }
-
-// Reference the NS/BRIDGE_PREFIX so the injected enable face can be built in
-// index.ts without duplicating the constants.
-export { NS, BRIDGE_PREFIX }

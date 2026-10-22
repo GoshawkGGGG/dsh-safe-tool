@@ -15,22 +15,25 @@ interface CacheEntry {
 }
 
 /**
- * LRU-style TTL cache for review decisions.
+ * TTL cache for review decisions.
  *
  * Uses a plain Map; entries expire based on wall-clock time.
  * No persistence — cache is in-memory only and restarts with dsh.
+ *
+ * The cleanup timer never keeps the process alive (`unref`) and is disposed
+ * through the plugin's effect scope, so reloads cannot accumulate timers.
  */
 export class ApprovalCache {
   private readonly store = new Map<string, CacheEntry>()
-  private readonly cleanupTimer: ReturnType<typeof setTimeout>
+  private readonly cleanupTimer: ReturnType<typeof setInterval>
+  private disposed = false
 
   constructor() {
-    // Periodic cleanup every 30s to avoid unbounded growth
+    // Periodic cleanup every 30s to avoid unbounded growth. `unref` keeps the
+    // timer from pinning the event loop (it also lets plain node test runs
+    // exit once the suite settles).
     this.cleanupTimer = setInterval(() => this.cleanup(), CACHE_TTL_MS / 2)
-    // Clean up on process exit
-    if (typeof process !== 'undefined') {
-      process.once('exit', () => clearInterval(this.cleanupTimer))
-    }
+    this.cleanupTimer.unref?.()
   }
 
   /**
@@ -51,11 +54,20 @@ export class ApprovalCache {
    * Store a decision in the cache with a 60-second TTL.
    */
   set(sessionId: string, toolName: string, argsHash: string, decision: ReviewDecision): void {
+    if (this.disposed) return
     const key = `${sessionId}\0${toolName}\0${argsHash}`
     this.store.set(key, {
       decision,
       expiresAt: Date.now() + CACHE_TTL_MS,
     })
+  }
+
+  /** Stop the cleanup timer and drop every entry. Idempotent. */
+  dispose(): void {
+    if (this.disposed) return
+    this.disposed = true
+    clearInterval(this.cleanupTimer)
+    this.store.clear()
   }
 
   /** Remove all expired entries. */

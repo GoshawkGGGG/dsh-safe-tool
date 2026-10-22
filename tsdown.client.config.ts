@@ -41,12 +41,12 @@ export default defineConfig({
     'react-dom/client',
     'react/jsx-runtime',
     '@deepseek-ai/cordis',
+    // Provided by the app's browser module table (bundled by the web shell).
     '@deepseek-ai/dsh-client-store',
-    '@deepseek-ai/dsh-client-ui-primitives',
     '@deepseek-ai/dsh-client-ui-slots',
-    '@deepseek-ai/dsh-client-ui-dockkit',
   ],
-  // 使用 renderChunk 钩子手动包装，确保 module 和 exports 正确定义
+  // Wrap the bundle into the browser module-loader factory format so the
+  // loader registers (and later materializes) this module like every other.
   plugins: [
     {
       name: 'dsh-css-modules-inline',
@@ -77,7 +77,6 @@ export default defineConfig({
     {
       name: 'dsh-module-wrapper',
       renderChunk(code: string) {
-        // 手动添加正确的模块包装，确保 var module 和 var exports 正确定义
         const wrapper = `window.__ModuleLoader__.load({
   id: "dsh-safe-tool",
   factory: (require) => {

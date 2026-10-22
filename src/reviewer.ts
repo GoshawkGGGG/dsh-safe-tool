@@ -1,36 +1,56 @@
 /**
  * Review subagent launcher.
  *
- * Starts a read-only spawn subagent with zero tool permissions and a
- * structured-output schema, then disposes it immediately after to prevent
- * session persistence.
+ * 0.2.x adaptation (dsh 0.2.1-rc.2):
+ * - Children start through `subagents.startActivation({ provider: 'spawn',
+ *   label, request, signal, delivery: 'caller' })`. The old
+ *   `subagents.start(name, request)` seam and its top-level `toolFilter`
+ *   field are gone; the reviewer's tool allowlist is enforced by the plugin's
+ *   `tools/pre-execute` guard (reviewer children may only call
+ *   `structured_output`), and the tool composition comes from the dedicated
+ *   reviewer parent's preset.
+ * - The child identity arrives as `activation.childId`; its durable header is
+ *   read back through `sessionPersistence.stat(childId)` AFTER disposal for
+ *   the optional disk cleanup.
+ * - The result promise never rejects on child-level failure — it resolves
+ *   `SubagentResult { output, structured?, diagnostic?, stopReason }` — so
+ *   time-outs and model failures are classified from `stopReason`.
  */
 
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { SessionHeader } from '@deepseek-ai/dsh-session'
 import { rmSync } from 'node:fs'
-import { dirname } from 'node:path'
+import { join } from 'node:path'
 import type { ReviewDecision } from './types.ts'
 
 export interface ReviewerRequest {
   /** Fully-built review prompt text, ready to send to the subagent. */
   prompt: string
-  provider?: string
-  model?: string
+  provider?: string | undefined
+  model?: string | undefined
   maxTokens: number
   timeoutMs: number
   /** When true, delete the review subagent's persisted session after settling. */
   deleteSession: boolean
+  /** Working directory for the reviewer child (the plugin's private workspace). */
+  cwd: string
+  /**
+   * Pin the child's composition to an agent preset. Unnecessary when the
+   * parent already mounts the preset (the child joins the parent's current
+   * generation); used on the fallback parent so the child still composes
+   * minimally.
+   */
+  agentPreset?: string | undefined
 }
 
 /**
  * How long to wait after `dispose()` before physically removing the review
  * subagent's persisted session. The session-persistence coordinator flushes a
  * session's buffered events on `session/disposed` (fire-and-forget), batched
- * with a `maxDelayMs` window (default 200ms in dsh). This settle delay lets
- * that final flush complete so we delete the finished artifact instead of
- * racing a write that would recreate it.
+ * with a `maxDelayMs` window (200ms in the shipped jsonl backend). This
+ * settle delay lets that final flush complete so we delete the finished
+ * artifact instead of racing a write that would recreate it.
  */
 const DELETE_SETTLE_DELAY_MS = 300
 
@@ -39,65 +59,156 @@ function settle(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms))
 }
 
+// ─── Artifact path resolution (0.2.x jsonl backend layout) ─────────────
+
+/**
+ * Encode one path segment exactly as the 0.2.x jsonl backend does
+ * (`encodeSegment`): safe characters pass through, everything else becomes
+ * `~XXXX` (uppercase hex code unit).
+ */
+function encodeSegment(raw: string): string {
+  if (raw.length === 0) throw new Error('cannot encode an empty path segment')
+  // Dot segments are the one traversal a character-wise encoder still lets
+  // through; the platform backend neutralizes them and so must we, because the
+  // cleanup path deletes `join(root, encodeSegment(id))` recursively.
+  if (raw === '.') return '~002E'
+  if (raw === '..') return '~002E~002E'
+  let out = ''
+  for (let i = 0; i < raw.length; i++) {
+    const code = raw.charCodeAt(i)
+    const ch = String.fromCharCode(code)
+    if (ch !== '~' && /^[A-Za-z0-9._-]$/.test(ch)) out += ch
+    else out += '~' + code.toString(16).toUpperCase().padStart(4, '0')
+  }
+  return out
+}
+
+/**
+ * Encode the project directory key exactly as the 0.2.x jsonl backend does
+ * (`projectKey`): separators collapse to `-`, unsafe code units become
+ * `~XXXX`, bounded to 251 characters.
+ */
+function projectKey(cwd: string): string {
+  if (cwd.length === 0) throw new Error('cannot encode an empty project path')
+  let readable = ''
+  let separatorRun = false
+  for (let i = 0; i < cwd.length; i++) {
+    const code = cwd.charCodeAt(i)
+    const ch = String.fromCharCode(code)
+    if (ch === '/' || ch === '\\' || ch === ':') {
+      if (!separatorRun) readable += '-'
+      separatorRun = true
+    } else if (ch !== '~' && /^[A-Za-z0-9._-]$/.test(ch)) {
+      readable += ch
+      separatorRun = false
+    } else {
+      readable += '~' + code.toString(16).toUpperCase().padStart(4, '0')
+      separatorRun = false
+    }
+  }
+  return `--${(readable.replace(/^-+/, '') || 'root').slice(0, 251)}--`
+}
+
+/**
+ * Resolve the persistence backend's session root. The public
+ * `SessionPersistence` contract exposes no path seam, but the shipped jsonl
+ * backend keeps its configured root on the instance; read it defensively and
+ * give up quietly when absent.
+ */
+function sessionRoot(ctx: Context): string | undefined {
+  const persistence = ctx.get('sessionPersistence', false) as
+    | { root?: unknown }
+    | undefined
+  const root = (persistence as { root?: unknown } | undefined)?.root
+  return typeof root === 'string' && root.length > 0 ? root : undefined
+}
+
 /**
  * Physically remove the review subagent's persisted session from disk.
  *
- * Uses `ctx.sessionPersistence.locate(header)` to resolve the backend-owned
- * artifact path (jsonl → the session's `session.jsonl.zstd` file), so the
- * plugin never hardcodes a `~/.dsh`-style path — it honours whatever
- * persistence backend and DSH_HOME the host is running. The whole session
- * directory (the artifact's parent) is removed.
+ * The 0.2.x jsonl layout is `<root>/<projectKey(cwd)>/<encodeSegment(id)>/`;
+ * the whole per-session directory is removed. The 0.1.x layout
+ * (`<root>/<id>/`) is removed too, so an upgrade leftover cannot linger.
  *
- * Also deletes the session's projection-cache record (`session_projcache`):
- * the projection cache checkpoints a session on `session/disposed`, so a
- * disposed review subagent would otherwise leave a ghost row in the sidebar
- * session list. The cache exposes no public delete, so we resolve the
- * storage-domain facility's `session_projcache` domain and delete its
- * `sessions` table row directly — again, no hardcoded path.
+ * Also deletes the session's projection-cache record (`session_projcache`
+ * domain, `sessions` table): the cache checkpoints a session on
+ * `session/disposed`, so a disposed review subagent would otherwise leave a
+ * ghost row in the sidebar session list.
  *
  * Best-effort: any failure is swallowed, leaving the record behind rather
  * than failing the review.
  */
 export async function removeReviewerSession(
   ctx: Context,
-  header: SessionHeader | undefined,
+  target: ReviewerSessionTarget,
 ): Promise<void> {
-  if (header === undefined) return
+  const id = String(target.id)
+  if (id.length === 0) return
 
   // Wait for the disposal-time writes to settle: both session-persistence
   // (`session/disposed` → retire → flush) and the projection cache
-  // (`session/disposed` → write) drain on the fire-and-forget dispose path,
-  // batched inside a default 200ms write window in dsh.
+  // (`session/disposed` → write) drain on the fire-and-forget dispose path.
   await settle(DELETE_SETTLE_DELAY_MS)
 
-  // 1. Remove the session's persistence artifact (jsonl → session.jsonl.zstd).
+  // 1. Remove the session's persistence artifact directories.
+  //
+  // The address is derived from the identity captured while the session was
+  // still live (id + cwd). It must NOT be re-resolved from the backend here:
+  // a disposed session is already gone from `stat()`/`list()` — reading it back
+  // afterwards yields nothing and silently skips the delete, which is exactly
+  // how review sessions used to accumulate on disk.
   try {
-    const persistence = ctx.get('sessionPersistence') as {
-      locate?: (meta: SessionHeader) => { path?: string } | undefined
-    } | undefined
-    const location = persistence?.locate?.(header)
-    if (location?.path) {
-      rmSync(dirname(location.path), { recursive: true, force: true })
+    const root = sessionRoot(ctx)
+    if (root === undefined) {
+      ctx.logger('dsh-safe-tool').warn('the session backend exposes no root; the review session artifact was left on disk')
+    } else {
+      const idSegment = encodeSegment(id)
+      // Current layout: nested under the project directory.
+      const current = target.cwd === undefined
+        ? join(root, '_no-cwd', idSegment)
+        : join(root, projectKey(target.cwd), idSegment)
+      rmSync(current, { recursive: true, force: true })
+      // Legacy (0.1.x) layout: directly under the root.
+      rmSync(join(root, idSegment), { recursive: true, force: true })
     }
-  } catch {
+  } catch (error) {
     // Best-effort: a transient lock or race leaves the record behind.
+    ctx.logger('dsh-safe-tool').warn('failed to remove the review session artifact %s: %C', id, error)
   }
 
   // 2. Remove the session's projection-cache record.
   try {
-    const facility = ctx.get('storageDomain') as {
+    const facility = ctx.get('storageDomain', false) as {
       get?: (name: string) => {
         table?: (name: string) => { delete?: (key: string) => Promise<unknown> } | undefined
       } | undefined
     } | undefined
     const table = facility?.get?.('session_projcache')?.table?.('sessions')
     if (table && typeof table.delete === 'function') {
-      await table.delete(header.id)
+      await table.delete(id)
     }
   } catch {
     // Best-effort: the cache is never an authority, so a stale ghost row only
     // costs a discarded cold read, not correctness.
   }
+}
+
+/**
+ * The durable identity of one review session artifact, captured while the
+ * session was still live. `cwd` selects the backend's project directory.
+ */
+export interface ReviewerSessionTarget {
+  /** Durable session id. */
+  id: string
+  /** The session's working directory, when known (the reviewer workspace). */
+  cwd?: string | undefined
+}
+
+/** Subset of the activation the launcher consumes. */
+interface ReviewActivation {
+  childId: string
+  result: Promise<{ output?: unknown; structured?: unknown; diagnostic?: unknown; stopReason?: string }>
+  dispose: () => Promise<void>
 }
 
 /**
@@ -119,97 +230,93 @@ export async function startReviewer(
 ): Promise<ReviewDecision> {
   // ctx.subagents is a declared inject — access directly, not ctx.get
   const subagents = (ctx as unknown as Record<string, unknown>).subagents as {
-    start: (name: string, request: Record<string, unknown>) => Promise<{
-      id: string
-      localAgent?: { session?: { header?: SessionHeader } }
-      result: Promise<unknown>
-      dispose: () => Promise<void>
-    }>
+    startActivation?: (spec: Record<string, unknown>) => Promise<ReviewActivation>
+    getProvider?: (name: string) => { name: string } | undefined
+    list?: () => string[]
   }
-  if (!subagents) {
+  if (!subagents?.startActivation) {
     throw new Error(
-      'dsh-safe-tool: subagents service not available — '
-      + 'ensure dsh-subagent-spawn-in-process is composed in the profile.',
+      'dsh-safe-tool: subagents.startActivation not available — '
+      + 'ensure @deepseek-ai/dsh-subagent-spawn-in-process is composed in the profile.',
     )
+  }
+  const providerName = subagents.getProvider?.('spawn') !== undefined || subagents.list?.().includes('spawn')
+    ? 'spawn'
+    : undefined
+  if (providerName === undefined) {
+    throw new Error('dsh-safe-tool: no `spawn` subagent provider registered')
   }
 
   // Build abort signal with timeout
   const controller = new AbortController()
   const timeoutId = setTimeout(() => controller.abort(), request.timeoutMs)
 
-  // Build deny-list: reviewer subagent should have no tools except structured_output
-  // Try dynamic introspection first; fall back to hardcoded candidate pool
-  let denyList: string[]
-  try {
-    const parentTools = (parent.ctx as unknown as Record<string, unknown>).tools as {
-      schemas?: (scope?: unknown) => { name: string }[]
-    }
-    if (parentTools?.schemas) {
-      // Dynamic: deny all tools parent actually has (structured_output is scoped, not here)
-      const availableTools = parentTools.schemas()
-      denyList = availableTools.map(t => t.name)
-    } else {
-      throw new Error('no schemas')
-    }
-  } catch {
-    // Fallback: deny the candidate pool if introspection fails
-    denyList = [
-      'ask_user_question', 'bash', 'dsh_im_return_file', 'describe_image',
-      'edit', 'get_goal', 'glob', 'grep', 'interrupt_agent', 'job_kill',
-      'job_list', 'job_output', 'list_agents', 'memos_get', 'memos_search',
-      'memos_skill_get', 'memos_skill_list', 'memos_timeline', 'plugin_install',
-      'plugin_search', 'plugin_status', 'plugin_uninstall', 'read', 'read_image',
-      'ralph', 'ssh_cluster', 'ssh_download', 'ssh_exec', 'ssh_list',
-      'ssh_tunnel', 'ssh_upload', 'subagent', 'subagent_fork', 'todo_write',
-      'update_goal', 'web_search', 'weknora_ask', 'weknora_list_knowledge_bases',
-      'weknora_read_document', 'weknora_search', 'workflow', 'write',
-    ]
-  }
-
-  let run: {
-    id: string
-    localAgent?: { session?: { header?: SessionHeader } }
-    result: Promise<unknown>
-    dispose: () => Promise<void>
-  } | undefined
+  let run: ReviewActivation | undefined
 
   try {
-    // Start the review subagent with zero execution permissions
-    // outputSchema automatically registers `structured_output` tool in child's scope
-    // toolFilter denies all parent tools (structured_output is scoped, not restricted)
-    run = await subagents.start('spawn', {
+    // Start the review subagent with zero execution permissions:
+    // - `cwd` pins the child into the plugin's private workspace, which the
+    //   `tools/pre-execute` guard uses to identify reviewer children.
+    // - `agentPreset` (when supplied) composes the child from the reviewer
+    //   preset; without it the child joins the reviewer parent's current
+    //   generation — 0.2.x routes tool composition through presets; the
+    //   start-time `toolFilter` field no longer exists.
+    // - `outputSchema` registers the child-scoped `structured_output` tool.
+    run = await subagents.startActivation({
+      provider: providerName,
       label: 'ai-approval-reviewer',
-      prompt: [{ type: 'text', text: request.prompt }],
-      parent,
-      signal: controller.signal,
-      // toolFilter is a TOP-LEVEL field of SubagentStartRequest
-      // Use deny-list to block all dangerous tools inherited from parent
-      toolFilter: { deny: denyList },
-      agentOptions: {
-        ...(request.provider ? { provider: request.provider } : {}),
-        ...(request.model ? { model: request.model } : {}),
-        maxTokens: request.maxTokens,
-      },
-      outputSchema: {
-        type: 'object' as const,
-        required: ['approve', 'reason'] as const,
-        properties: {
-          approve: {
-            type: 'boolean',
-            description: '是否批准该工具调用执行。true=批准，false=拒绝。',
-          },
-          reason: {
-            type: 'string',
-            description: '批准或拒绝的原因，使用中文，简明扼要，不超过50字。',
-          },
+      request: {
+        cwd: request.cwd,
+        ...(request.agentPreset !== undefined ? { agentPreset: request.agentPreset } : {}),
+        prompt: [{ type: 'text', text: request.prompt }],
+        parent,
+        agentOptions: {
+          ...(request.provider !== undefined ? { provider: request.provider } : {}),
+          ...(request.model !== undefined ? { model: request.model } : {}),
+          maxTokens: request.maxTokens,
         },
-        additionalProperties: false,
+        outputSchema: {
+          type: 'object' as const,
+          required: ['approve', 'reason'] as const,
+          properties: {
+            approve: {
+              type: 'boolean',
+              description: '是否批准该工具调用执行。true=批准，false=拒绝。',
+            },
+            reason: {
+              type: 'string',
+              description: '批准或拒绝的原因，使用中文，简明扼要，不超过50字。',
+            },
+          },
+          additionalProperties: false,
+        },
       },
+      signal: controller.signal,
+      delivery: 'caller',
     })
 
-    // Wait for the subagent to complete
+    // Wait for the subagent to complete. The promise resolves (never rejects)
+    // with the terminal SubagentResult; a model/transport failure arrives as
+    // `stopReason: 'error'` (plus `diagnostic`), a cancellation as
+    // `'aborted'`.
     const result = await run.result
 
+    if (controller.signal.aborted && result?.stopReason !== 'completed') {
+      return {
+        approve: false,
+        reason: `审核超时（>${request.timeoutMs}ms），已拒绝`,
+      }
+    }
+    if (result?.stopReason === 'error') {
+      // A model/transport failure is the 0.2.x form of the 0.1.x rejection:
+      // `run.result` now RESOLVES on child-level failure instead of rejecting,
+      // so this branch is the old `catch` — which denied unconditionally, even
+      // when a partial structured block had already been produced.
+      const detail = typeof result.diagnostic === 'string' && result.diagnostic.length > 0
+        ? result.diagnostic.slice(0, 80)
+        : '模型或传输失败'
+      return { approve: false, reason: `审核服务异常：${detail}` }
+    }
     return extractDecision(result as { structured?: unknown; output?: ContentBlock[] })
   } catch (error) {
     if (controller.signal.aborted) {
@@ -224,21 +331,35 @@ export async function startReviewer(
     }
   } finally {
     clearTimeout(timeoutId)
-    // Capture the child session header BEFORE dispose: dispose tears down the
-    // agent scope, after which `localAgent.session.header` may be unreachable.
-    const header = run?.localAgent?.session?.header
+    // Capture the child's identity BEFORE dispose. A disposed session is already
+    // gone from the backend (`stat()`/`list()` stop resolving it), so anything
+    // the cleanup needs must be read while it is still live — the cwd selects
+    // the artifact's project directory, and the id names its segment.
+    const childId = run?.childId
+    let childCwd = request.cwd
+    if (request.deleteSession && childId !== undefined) {
+      try {
+        const persistence = ctx.get('sessionPersistence', false) as {
+          stat?: (id: string) => Promise<{ header?: SessionHeader } | undefined>
+        } | undefined
+        const live = (await persistence?.stat?.(childId))?.header
+        if (typeof live?.cwd === 'string' && live.cwd.length > 0) childCwd = live.cwd
+      } catch {
+        // Fall back to the spawn cwd, which is the same directory.
+      }
+    }
     // Always dispose to prevent session persistence
     // dispose() is idempotent — safe to call even if already settled
     if (run !== undefined) {
       try {
         await run.dispose()
       } catch {
-        // Non-fatal: session will be cleaned up on next GC or profile restart
+        // Non-fatal: the artifact is still removed below by its known identity.
       }
     }
     // Optionally delete the review subagent's persisted session from disk.
-    if (request.deleteSession && header !== undefined) {
-      await removeReviewerSession(ctx, header)
+    if (request.deleteSession && childId !== undefined) {
+      await removeReviewerSession(ctx, { id: String(childId), cwd: childCwd })
     }
   }
 }
@@ -387,11 +508,8 @@ function decisionFromText(text: string): ReviewDecision | undefined {
 /**
  * Extract every balanced `{...}` span from `text`, in REVERSE order (last
  * first). The model's authoritative decision JSON sits at the very end of its
- * reply; everything before it — thinking preamble, a copy of the tool's JSON
- * arguments, a `bash` command body that itself embeds JSON — is noise that must
- * never be mistaken for the verdict. Returning last-first lets the caller try
- * the trailing object first and walk backwards only when it fails to yield a
- * decision.
+ * reply; everything before it is noise that must never be mistaken for the
+ * verdict.
  */
 function extractJsonObjectsReverse(text: string): string[] {
   const result: string[] = []

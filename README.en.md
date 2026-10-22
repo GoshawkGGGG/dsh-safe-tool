@@ -7,7 +7,7 @@ AI-powered command approval plugin for DeepSeek Harness. Intercepts model tool c
 ## Features
 
 - **Intercept & Review**: Hook into `tools/pre-execute` waterfall to review every matching tool call
-- **Read-Only Reviewer**: Subagent has zero tool permissions (`toolFilter: { deny: [all tools] }`) — only calls `structured_output` to return decisions
+- **Read-Only Reviewer**: Subagent has zero execution permissions — the `tools/pre-execute` guard denies every execution tool for the reviewer identity (its own session's `subagent/descriptor` label) and allows only `structured_output` (dsh 0.2.x removed the start-time `toolFilter`)
 - **Dedicated Reviewer Preset**: Review subagent inherits a dedicated parent agent's preset (default `minimal`), isolated from the main agent's preset; falls back to the main agent when the preset is unknown
 - **Session Cleanup**: By default (`deleteReviewerSessions: true`) the review subagent's session is deleted from disk after settlement; disable to keep it for audit
 - **Configurable Model**: Use any dsh-registered provider/model, or inherit from parent agent (`exec.agent.options.provider/model`)
@@ -165,7 +165,7 @@ tools/pre-execute hook
     |
     v
 Start read-only subagent
-    |-- toolFilter: { deny: [all tools] }          (zero execution permissions)
+    |-- execution tools denied by the pre-execute guard  (zero execution permissions)
     |-- outputSchema: { approve, reason }           (forced structured output)
     |-- provider/model: inherited from parent or config
     -- prompt: tool name + args + cwd + criteria
@@ -186,7 +186,7 @@ Dispose subagent (session cleanup)
 
 | Aspect | Measure |
 |--------|---------|
-| Zero tool access | `toolFilter: { deny: [all tools] }` — reviewer cannot call any execution tools |
+| Zero tool access | The `tools/pre-execute` guard denies every execution tool for the reviewer child and allows only `structured_output` |
 | Isolated context | Dedicated parent agent (`minimal` preset): reviewer has no main-session history, fresh context |
 | Structured output | `outputSchema` forces `{approve, reason}` output — zero free text |
 | Session cleanup | Deletes the review subagent's disk records by default (`deleteReviewerSessions: true`) |
@@ -200,12 +200,22 @@ Dispose subagent (session cleanup)
 ## Development
 
 ```sh
-# Build plugin (installs dependencies and produces lib/)
+# Build the plugin (installs dependencies and produces lib/; a missing or
+# truncated artifact fails the build)
 node scripts/build.js
 
-# Type check
-pnpm run typecheck
+# Type check (both the server and the client tsconfigs)
+npm run typecheck
+
+# Tests: they exercise the BUILT bundle in lib/, not src/
+npm test
 ```
+
+The suite runs against the built artifact, so build first (`lib/` is not
+committed); it fails with an actionable message when the bundle is missing. It
+also borrows the running harness's `@deepseek-ai/dsh-session-persistence(-jsonl)`
+and `@deepseek-ai/dsh-subagent`; set `DSH_PLATFORM_PACKAGES_DIR` when the harness
+lives elsewhere.
 
 All `@deepseek-ai/*` dependencies are declared in `package.json` and resolved
 from the npm registry directly.

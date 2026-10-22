@@ -4,9 +4,9 @@ export interface ApprovalConfig {
   /** Master switch — when false, the plugin does nothing. */
   enabled: boolean
   /** dsh-registered provider ID for the review model; omitted = inherit from parent agent. */
-  provider?: string
+  provider?: string | undefined
   /** Model name for the review agent; omitted = inherit from parent agent. */
-  model?: string
+  model?: string | undefined
   /** Maximum tokens the review agent may consume per call. */
   maxTokens: number
   /** Timeout in milliseconds for a single review request. */

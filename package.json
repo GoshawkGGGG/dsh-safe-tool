@@ -1,7 +1,10 @@
 {
   "name": "dsh-safe-tool",
-  "version": "0.1.0",
-  "description": "AI-powered command approval plugin for DeepSeek Harness — intercepts tool calls and routes them through a read-only review subagent",
+  "version": "0.2.0",
+  "description": "AI-powered command approval plugin for DeepSeek Harness - intercepts tool calls and routes them through a read-only review subagent",
+  "engines": {
+    "dsh": ">=0.2.1-rc.2 <0.3.0"
+  },
   "type": "module",
   "main": "lib/index.js",
   "exports": {
@@ -11,22 +14,22 @@
     "./client": {
       "default": "./lib/client.js"
     },
-    "./invariant": {
-      "default": "./lib/invariant.js"
-    },
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg",
     "./package.json": "./package.json"
   },
   "files": [
     "lib/index.js",
-    "lib/invariant.js",
     "lib/client.js",
-    "lib/style.css",
+    "locale/*.json",
+    "icon.svg",
     "cordis.patch.yml"
   ],
   "license": "MIT",
   "scripts": {
     "build": "node scripts/build.js",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.client.json",
+    "test": "node --test test/plugin.test.mjs test/client-render.test.mjs test/client-dom.test.mjs test/real-cordis.test.mjs"
   },
   "dsh": {
     "bundle": {
@@ -35,36 +38,46 @@
     "client": {
       "platform": "web",
       "inject": [
-        "@deepseek-ai/dsh-client-ui-settings-plugins",
+        "@deepseek-ai/dsh-api-remotes",
+        "@deepseek-ai/dsh-client-ui-settings",
+        "@deepseek-ai/dsh-client-ui-plugin-manager",
         "@deepseek-ai/dsh-client-ui-conversation"
-      ]
+      ],
+      "immediately": true
     }
   },
   "dependencies": {
-    "@deepseek-ai/cordis": "^4.0.2",
+    "@deepseek-ai/cordis": "~4.0.5",
     "@deepseek-ai/cosmokit": "^1.8.3",
-    "@deepseek-ai/dsh-agent": "^0.1.1-rc.2",
-    "@deepseek-ai/dsh-api-remotes": "0.1.5-rc.3",
-    "@deepseek-ai/dsh-client-store": "0.1.5-rc.3",
-    "@deepseek-ai/dsh-client-ui-conversation": "0.1.5-rc.3",
-    "@deepseek-ai/dsh-client-ui-renderer": "0.1.5-rc.3",
-    "@deepseek-ai/dsh-client-ui-session": "0.1.5-rc.3",
-    "@deepseek-ai/dsh-client-ui-settings-plugins": "0.1.5-rc.3",
-    "@deepseek-ai/dsh-client-ui-slots": "0.1.5-rc.3",
-    "@deepseek-ai/dsh-invariants": "^0.1.1-rc.2",
-    "@deepseek-ai/dsh-session": "^0.1.1-rc.2",
-    "@deepseek-ai/dsh-settings": "^0.1.1-rc.2",
-    "@deepseek-ai/dsh-subagent": "^0.1.1-rc.2",
-    "@deepseek-ai/dsh-user-approval": "^0.1.1-rc.2",
-    "@deepseek-ai/schemastery": "^3.18.2"
+    "@deepseek-ai/dsh-agent": "0.2.1-rc.2",
+    "@deepseek-ai/dsh-api-remotes": "0.2.1-rc.2",
+    "@deepseek-ai/dsh-client-store": "0.2.1-rc.2",
+    "@deepseek-ai/dsh-client-ui-conversation": "0.2.1-rc.2",
+    "@deepseek-ai/dsh-client-ui-plugin-manager": "0.2.1-rc.2",
+    "@deepseek-ai/dsh-client-ui-renderer": "0.2.1-rc.2",
+    "@deepseek-ai/dsh-client-ui-session": "0.2.1-rc.2",
+    "@deepseek-ai/dsh-client-ui-settings": "0.2.1-rc.2",
+    "@deepseek-ai/dsh-client-ui-slots": "0.2.1-rc.2",
+    "@deepseek-ai/dsh-session": "0.2.1-rc.2",
+    "@deepseek-ai/dsh-settings": "0.2.1-rc.2",
+    "@deepseek-ai/dsh-subagent": "0.2.1-rc.2",
+    "@deepseek-ai/dsh-tools": "0.2.1-rc.2",
+    "@deepseek-ai/dsh-user-approval": "0.2.1-rc.2",
+    "@deepseek-ai/schemastery": "~3.18.5"
   },
   "devDependencies": {
+    "@deepseek-ai/dsh-client-locale": "0.2.1-rc.2",
     "@tsdown/css": "^0.22.14",
     "@types/node": "^22.0.0",
     "@types/react": "^18.3.0",
     "@types/react-dom": "^18.3.0",
+    "immer": "^10.1.1",
+    "jsdom": "25.0.1",
     "lightningcss": "^1.33.0",
+    "react": "18.3.1",
+    "react-dom": "18.3.1",
     "tsdown": "0.22.2",
-    "typescript": "^5.0.0"
+    "typescript": "^5.0.0",
+    "zustand": "^4.5.7"
   }
 }

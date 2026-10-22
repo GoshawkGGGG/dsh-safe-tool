@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "AI Tool Execution Approval",
+    "description": "Intercepts tool calls and has an AI subagent review them for safety"
+  }
+}

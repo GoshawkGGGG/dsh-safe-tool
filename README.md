@@ -16,7 +16,7 @@ DeepSeek Harness 的 AI 命令审批插件。拦截模型工具调用，通过�
 - **审核标准热更**：编辑 `$DSH_HOME/dsh-safe-tool/approval-criteria.md` 即时生效，无需重启
 - **60 秒缓存**：同一 (会话, 工具, 参数) 60 秒内复用决策，避免重复审批延迟
 - **自动放行白名单**：正则匹配参数，已知安全命令直接跳过审批
-- **Web UI 设置卡**：在 Settings → Plugins → "AI 工具执行审批" 中可视化配置
+- **Web UI 设置卡**：在 Settings → Plugins → "AI 工具执行审批" 中可视化配置（含审批统计的查看与清理）
 
 ---
 
@@ -59,14 +59,17 @@ dsh web --profile web                              # 启动 Web UI
 
 ## 配置
 
-### 设置命名空间
+### 配置位置
 
-插件内部使用 `dsh-safe-tool` 作为 settings 命名空间。
-Web UI 中显示为卡片标题 **"AI 工具执行审批"**：
+配置就是本插件在组合（`cordis.patch.yml`）里的那一行 `dsh-safe-tool` 条目；
+dsh 0.2.x 只按 Loader 条目 id 寻址配置，自定义 settings 命名空间已移除，
+因此配置界面挂在插件行上，标题为 **"AI 工具执行审批"**：
 
 ```
 Settings → Plugins → "AI 工具执行审批"
 ```
+
+改动实时生效（配置字段为 volatile，写入即提交到运行中的实例，无需重启）。
 
 ### 配置项说明
 
@@ -154,7 +157,7 @@ tools/pre-execute hook
     │
     ▼
 启动只读子代理
-    ├─ toolFilter: { deny: [所有工具] }          (零执行权限)
+    ├─ 执行工具在黑名单中被 pre-execute 守卫拒绝  (零执行权限，仅放行 structured_output)
     ├─ outputSchema: { approve, reason }          (强制结构化输出)
     ├─ provider/model: 从父代理继承或 config 指定
     └─ prompt: 工具名 + 参数 + 工作目录 + 审批标准
@@ -175,7 +178,7 @@ tools/pre-execute hook
 
 | 维度 | 措施 |
 |------|------|
-| 零工具访问 | `toolFilter: { deny: [所有工具] }` —— 审核子代理无法调用任何执行工具 |
+| 零工具访问 | `tools/pre-execute` 守卫按审核子代理身份（子代理自身会话中的 `subagent/descriptor` 标签）拒绝其一切执行工具，仅放行 `structured_output`（dsh 0.2.x 已移除启动期 `toolFilter`） |
 | 隔离上下文 | 专属 agent（`minimal` 预设）作为父代理，审核子代理无主会话历史，全新上下文 |
 | 结构化输出 | `outputSchema` 强制模型输出 `{approve, reason}`，零自由文本 |
 | 会话清除 | 默认删除审批子代理的磁盘会话记录（`deleteReviewerSessions: true`） |
@@ -189,12 +192,20 @@ tools/pre-execute hook
 ## 开发
 
 ```sh
-# 构建插件（自动安装依赖并产出 lib/）
+# 构建插件（自动安装依赖并产出 lib/；产物缺失或过小会让构建失败）
 node scripts/build.js
 
-# 类型检查
-pnpm run typecheck
+# 类型检查（服务端与客户端两份 tsconfig 都检查）
+npm run typecheck
+
+# 测试：直接测 lib/ 里构建出来的产物，不是 src/
+npm test
 ```
+
+测试跑的是构建产物，因此**必须先执行 `node scripts/build.js`**（`lib/` 不进版本库）；
+缺少产物时测试会给出明确提示而不是堆栈。测试还会借用宿主自带的
+`@deepseek-ai/dsh-session-persistence(-jsonl)` 与 `@deepseek-ai/dsh-subagent`
+（默认取当前运行的 harness，位置不同时用 `DSH_PLATFORM_PACKAGES_DIR` 覆盖）。
 
 所有 `@deepseek-ai/*` 依赖均声明在 `package.json` 中，从 npm registry
 直接解析。
