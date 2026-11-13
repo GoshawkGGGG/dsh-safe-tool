@@ -413,6 +413,15 @@ test('header button renders, toggles the enable switch, and does not storm', asy
     const chip = globalThis.document.querySelector('button')
     click(chip)
     await settle(20)
+    // dsh 0.2.2-rc.1 regression: the header title cluster clips overflow
+    // (`overflow: clip` + `container-type`), so the popover MUST portal to
+    // document.body — inside the mount root it would be clipped shut.
+    const panel = globalThis.document.querySelector('[role="dialog"]')
+    assert.ok(panel, 'open popover rendered as a dialog')
+    assert.ok(
+      !globalThis.document.getElementById('root').contains(panel),
+      'popover must portal outside the clipped header cluster (document.body, not the slot root)',
+    )
     const toggle = [...globalThis.document.querySelectorAll('button')].find(b => /已启用|已禁用/.test(b.textContent ?? ''))
     assert.ok(toggle, 'enable toggle present in the popover')
     click(toggle)

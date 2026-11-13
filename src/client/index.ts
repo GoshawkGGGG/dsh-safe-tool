@@ -9,7 +9,10 @@
  *   exist).
  * - The session-header approval button keeps its slot
  *   (`conversation.session.header.actions`); its enable switch writes through
- *   the shared `configForms` service.
+ *   the shared `configForms` service. Its popover portals to `document.body`:
+ *   since dsh 0.2.2-rc.1 the header's title cluster clips overflow
+ *   (`overflow: clip` + `container-type: inline-size`), and the slot contract
+ *   requires overlays to portal.
  * - Per-session approval tallies live in this plugin's own settings document
  *   (its Loader entry) and are served through the plugin's own HTTP bridge.
  *   Refresh is push-triggered by `settings/document-updated` for that entry —
@@ -86,19 +89,20 @@ const css = [
   '.dshst-summary{color:var(--dsw-alias-label-tertiary);font-size:13px}',
 ].join('')
 
-function injectCss(cssText: string): void {
-  if (typeof document === 'undefined') return
-  const tagId = 'dsh-safe-tool/card.css'
-  if (document.querySelector(`style[data-plugin-css=${JSON.stringify(tagId)}]`)) return
-  const tag = document.createElement('style')
-  tag.dataset.plugin = 'dsh-safe-tool'
-  tag.dataset.pluginCss = tagId
-  tag.textContent = cssText
-  document.head.appendChild(tag)
-}
-
 export function apply(ctx: ClientContext): void {
-  injectCss(css)
+  // Card CSS is an effect-owned resource: the tag is removed when this bundle's
+  // client run is disposed, instead of leaking across reloads in document.head.
+  ctx.effect(() => {
+    if (typeof document === 'undefined') return () => {}
+    const tagId = 'dsh-safe-tool/card.css'
+    if (document.querySelector(`style[data-plugin-css=${JSON.stringify(tagId)}]`) !== null) return () => {}
+    const tag = document.createElement('style')
+    tag.dataset.plugin = 'dsh-safe-tool'
+    tag.dataset.pluginCss = tagId
+    tag.textContent = css
+    document.head.appendChild(tag)
+    return () => { tag.remove() }
+  }, 'dsh-safe-tool: card css')
 
   // Shared config face for this bundle's row: reads derive from the shared
   // describe mirror; writes go through the form controller, which resolves the
