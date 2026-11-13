@@ -155,9 +155,19 @@ export function apply(ctx: ClientContext): void {
   // Visible copy flows through the Client locale service (never literals): the
   // dictionaries are registered for this bundle's namespace and every render
   // reads them through the bound translate function.
-  for (const [locale, dictionary] of Object.entries(UI_DICTIONARIES)) {
-    ctx.locale.register(LOCALE_NAMESPACE, locale, dictionary)
-  }
+  // The registration is effect-owned (the shipped `ui-jobs` pattern): the
+  // service-level dictionary map does not track the registering context, so
+  // un-held disposers would both leak the dictionaries and make a client-half
+  // reload throw "namespace already has locale" on re-registration.
+  ctx.effect(
+    () => {
+      const disposers = Object.entries(UI_DICTIONARIES).map(
+        ([locale, dictionary]) => ctx.locale.register(LOCALE_NAMESPACE, locale, dictionary),
+      )
+      return () => { for (const dispose of disposers) dispose() }
+    },
+    'dsh-safe-tool: locale dictionaries',
+  )
   const t = ctx.locale.bind(LOCALE_NAMESPACE)
 
   const statsFace = { t, fetchStats, unsaved: unsavedStore }

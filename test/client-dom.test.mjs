@@ -27,8 +27,9 @@ import { requireBuiltArtifact } from './helpers/preconditions.mjs'
 function fakeLocale() {
   const dicts = new Map()
   return {
-    register(ns, locale, dict) {
-      dicts.set(`${ns}:${locale}`, dict)
+    register(ns, localeOrDicts, dict) {
+      const pairs = typeof localeOrDicts === 'string' ? [[localeOrDicts, dict]] : Object.entries(localeOrDicts)
+      for (const [locale, dictionary] of pairs) dicts.set(`${ns}:${locale}`, dictionary)
       return () => {}
     },
     bind(ns) {

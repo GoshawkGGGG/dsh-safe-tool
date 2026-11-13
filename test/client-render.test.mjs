@@ -28,8 +28,9 @@ import { requireBuiltArtifact } from './helpers/preconditions.mjs'
 function fakeLocale() {
   const dicts = new Map()
   return {
-    register(ns, locale, dict) {
-      dicts.set(`${ns}:${locale}`, dict)
+    register(ns, localeOrDicts, dict) {
+      const pairs = typeof localeOrDicts === 'string' ? [[localeOrDicts, dict]] : Object.entries(localeOrDicts)
+      for (const [locale, dictionary] of pairs) dicts.set(`${ns}:${locale}`, dictionary)
       return () => {}
     },
     bind(ns) {
@@ -94,10 +95,16 @@ function materializeClient() {
 
     locale: sharedLocale,
     configForms: { get: () => undefined },
-    // Server rendering never runs effects, so the effect bodies (including the
-    // `ctx.remote.$on` subscription) are intentionally not executed here. The
-    // live subscription is covered by the real-DOM suite instead.
-    effect: () => () => {},
+    // The real Client Context runs each effect body immediately and keeps its
+    // disposer; this fake runs the bodies the same way (the locale
+    // dictionaries register inside one) and drops the disposers — every test
+    // materializes a fresh module. `remote.$on` returns a no-op disposer so
+    // the stats subscription registers without a live carrier.
+    remote: { $on: () => () => {} },
+    effect: (fn) => {
+      const dispose = fn()
+      return typeof dispose === 'function' ? dispose : () => {}
+    },
   })
   return { modExports, live }
 }
