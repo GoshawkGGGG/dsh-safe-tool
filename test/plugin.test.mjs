@@ -721,11 +721,30 @@ test('child error result denies with the diagnostic', async (t) => {
 test('every terminal stop reason maps to the 0.1.x outcome', async (t) => {
   // run.result resolves for ALL terminal outcomes in 0.2.x (it never rejects on
   // child-level failure), so each stop reason must land where the 0.1.x flow put
-  // it: a model/transport failure is the old rejection (deny), a completed run
-  // is parsed, and a partial/unparseable run falls back to human approval.
+  // it: a completed run is parsed, a partial/unparseable run falls back to human
+  // approval, and a failure is denied — EXCEPT that an 'error' without a
+  // diagnostic is the framework's rewrite of a text-only completion, so content
+  // is consulted first and a complete decision (structured or parsed text) wins
+  // over the classification.
   const cases = [
     { stopReason: 'error', result: { output: [], diagnostic: 'provider 500' }, expect: 'deny', matches: /审核服务异常.*provider 500/ },
-    { stopReason: 'error', result: { output: [], structured: { approve: true, reason: '看起来没问题' } }, expect: 'deny', matches: /审核服务异常/ },
+    // Content first: a delivered structured decision is adopted even under an
+    // 'error' classification (the child delivered its verdict, then failed).
+    { stopReason: 'error', result: { output: [], structured: { approve: true, reason: '看起来没问题' } }, expect: 'allow', matches: null },
+    // The 2026-11-13 regression (session 9364a260): the framework rewrites a
+    // text-only completion to stopReason 'error' with NO diagnostic; the plain
+    // answer in `output` is a complete decision and must be adopted.
+    {
+      stopReason: 'error',
+      result: {
+        output: [{ type: 'text', text: '{"approve": true, "reason": "命令仅输出数字 1，无副作用、无危险操作、无凭据访问，完全无害可执行。"}' }],
+      },
+      expect: 'allow',
+      matches: null,
+    },
+    // Text-only completion whose text yields no decision: fail closed with a
+    // truthful message — never the old, misleading "模型或传输失败".
+    { stopReason: 'error', result: { output: [{ type: 'text', text: '我觉得没问题' }] }, expect: 'deny', matches: /模型未交付结构化结果/ },
     { stopReason: 'completed', result: { output: [], structured: { approve: true, reason: '只读操作' } }, expect: 'allow', matches: null },
     { stopReason: 'max-tokens', result: { output: [], structured: { approve: false, reason: '输出被截断' } }, expect: 'deny', matches: /输出被截断/ },
     { stopReason: 'max-tokens', result: { output: [], diagnostic: 'hit ceiling' }, expect: 'human', matches: null },

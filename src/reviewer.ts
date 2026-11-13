@@ -14,7 +14,12 @@
  *   the optional disk cleanup.
  * - The result promise never rejects on child-level failure — it resolves
  *   `SubagentResult { output, structured?, diagnostic?, stopReason }` — so
- *   time-outs and model failures are classified from `stopReason`.
+ *   time-outs and model failures are classified from `stopReason`. One
+ *   caveat: a session that COMPLETED without capturing the declared
+ *   `outputSchema` (a model that answered in plain text instead of calling
+ *   `structured_output`) is rewritten to `stopReason: 'error'` WITHOUT a
+ *   diagnostic, carrying its complete answer in `output` — so the error
+ *   branch consults the decision parsers before failing closed.
  */
 
 import type { Context } from '@deepseek-ai/cordis'
@@ -308,13 +313,24 @@ export async function startReviewer(
       }
     }
     if (result?.stopReason === 'error') {
-      // A model/transport failure is the 0.2.x form of the 0.1.x rejection:
-      // `run.result` now RESOLVES on child-level failure instead of rejecting,
-      // so this branch is the old `catch` — which denied unconditionally, even
-      // when a partial structured block had already been produced.
+      // Content first, classification second. Two producers write
+      // `stopReason: 'error'`:
+      // 1. The framework's settlement rewrite (dsh-subagent
+      //    `captureLocalResult`): outputSchema declared, nothing captured, and
+      //    the session still COMPLETED — a model that answered in plain text
+      //    instead of calling `structured_output`. That rewrite carries no
+      //    diagnostic, and `output` holds the model's complete answer.
+      // 2. A genuine model/transport failure, which carries a `diagnostic`.
+      // So the error branch must consult the decision parsers (structured
+      // first, then the free-form text chain written for exactly such models)
+      // and adopt a complete decision instead of discarding it; only an
+      // undecipherable result fails closed, named by the diagnostic when the
+      // framework provided one.
+      const fromContent = extractDecision(result as { structured?: unknown; output?: ContentBlock[] })
+      if (fromContent.fallback !== true) return fromContent
       const detail = typeof result.diagnostic === 'string' && result.diagnostic.length > 0
         ? result.diagnostic.slice(0, 80)
-        : '模型或传输失败'
+        : '模型未交付结构化结果，且输出无可解析决策'
       return { approve: false, reason: `审核服务异常：${detail}` }
     }
     return extractDecision(result as { structured?: unknown; output?: ContentBlock[] })
@@ -514,7 +530,11 @@ function decisionFromText(text: string): ReviewDecision | undefined {
 function extractJsonObjectsReverse(text: string): string[] {
   const result: string[] = []
   let searchEnd = text.length
-  for (;;) {
+  // `String.lastIndexOf` clamps a negative fromIndex to 0, so a `{` at index 0
+  // would be found again on every pass and never terminate. The loop must
+  // stop once the search window is exhausted (`searchEnd === 0` means the
+  // index-0 candidate was the last one processed).
+  while (searchEnd > 0) {
     const open = text.lastIndexOf('{', searchEnd - 1)
     if (open === -1) break
     const candidate = scanBalancedObject(text, open)
