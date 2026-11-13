@@ -1,0 +1,9 @@
+# Build-script decisions for transitive devDependencies. None of these native
+# builds are needed: this repo uses the platform packages only for typecheck
+# and bundling; tests load the REAL packages from the installed dsh.
+allowBuilds:
+  '@deepseek-ai/dsh-subprocess-local': false
+  '@google/genai': false
+  koffi: false
+  node-pty: false
+  protobufjs: false

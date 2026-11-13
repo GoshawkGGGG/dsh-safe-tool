@@ -6,8 +6,6 @@
     "module": "esnext",
     "moduleResolution": "bundler",
     "jsx": "react-jsx",
-    "declaration": true,
-    "sourceMap": true,
     "skipLibCheck": true,
     "esModuleInterop": true,
     "allowImportingTsExtensions": true,

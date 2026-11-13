@@ -1,5 +1,4 @@
 node_modules/
 lib/
-pnpm-workspace.yaml
 .pnpm-store/
 .dsh/
