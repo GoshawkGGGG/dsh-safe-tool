@@ -1,0 +1,141 @@
+# 构建与发布：推送 main → 构建 → 发布 GitHub Release。
+#
+# 沿用既有 Release 的标签与命名约定：
+#   标签  v<package.json version>   （既有：v0.2.0）
+#   标题  dsh-safe-tool-<version>   （既有：dsh-safe-tool-0.2.0）
+# 在此基础上完善发布内容：dsh 兼容区间（engines.dsh）、自上一标签以来的
+# 提交变更、安装方式、构建信息、产物 sha256 校验和。
+#
+# 版本门控：仅当 v<version> 尚不存在时发布。版本号变更的推送产生新
+# Release；版本号未变的后续推送跳过（以"已存在"日志成功结束）。
+#
+# 注：测试套件依赖本机 dsh 安装路径（test/helpers 里硬编码），无法在
+# CI 运行，故流水线只做 typecheck + build + pack。
+name: Release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out（全量历史与标签，供变更区间计算）
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Read version and dsh compatibility
+        id: meta
+        run: |
+          echo "version=$(node -p "require('./package.json').version")" >> "$GITHUB_OUTPUT"
+          echo "dsh=$(node -p "require('./package.json').engines.dsh")" >> "$GITHUB_OUTPUT"
+
+      - name: Version gate（v<version> 已存在则跳过发布）
+        id: gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          if gh release view "v$VERSION" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "v$VERSION 已发布，本次推送跳过。"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "将发布 v$VERSION。"
+          fi
+
+      - name: Install
+        if: steps.gate.outputs.exists == 'false'
+        run: pnpm install --frozen-lockfile=false
+
+      - name: Typecheck
+        if: steps.gate.outputs.exists == 'false'
+        run: pnpm run typecheck
+
+      - name: Build
+        if: steps.gate.outputs.exists == 'false'
+        run: pnpm run build
+
+      - name: Pack and checksums
+        if: steps.gate.outputs.exists == 'false'
+        run: |
+          mkdir -p dist
+          pnpm pack --pack-destination dist
+          (cd dist && sha256sum ./*.tgz > checksums.txt)
+
+      - name: Compose release notes
+        if: steps.gate.outputs.exists == 'false'
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+          DSH_RANGE: ${{ steps.meta.outputs.dsh }}
+        run: |
+          PREV_TAG="$(git tag --sort=-v:refname --list 'v*' | head -1 || true)"
+          NODE_VER="$(node -v)"
+          PNPM_VER="$(pnpm -v)"
+          {
+            echo "适配 dsh \`$DSH_RANGE\`（engines.dsh）。"
+            echo
+            echo "## 更新内容"
+            if [ -n "$PREV_TAG" ]; then
+              echo "自 \`$PREV_TAG\` 以来："
+              echo
+              echo '```'
+              git log --no-merges --oneline "$PREV_TAG..HEAD"
+              echo '```'
+            else
+              echo '```'
+              git log --no-merges --oneline
+              echo '```'
+            fi
+            echo
+            echo "## 安装"
+            echo '```bash'
+            echo "dsh plugin --profile <name> add https://github.com/$GITHUB_REPOSITORY/releases/download/v$VERSION/dsh-safe-tool-$VERSION.tgz"
+            echo "# 或下载 tgz 后本地安装："
+            echo "dsh plugin --profile <name> add ./dsh-safe-tool-$VERSION.tgz"
+            echo '```'
+            echo
+            echo "## 构建信息"
+            echo "- 提交：\`$GITHUB_SHA\`"
+            echo "- Node \`$NODE_VER\` / pnpm \`$PNPM_VER\`"
+            echo
+            echo "## 校验（sha256）"
+            echo '```'
+            cat dist/checksums.txt
+            echo '```'
+          } > notes.md
+          cat notes.md
+
+      - name: Publish release
+        if: steps.gate.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          gh release create "v$VERSION" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "dsh-safe-tool-$VERSION" \
+            --notes-file notes.md \
+            dist/*
