@@ -591,10 +591,13 @@ export function apply(ctx: Context, config: ApprovalConfig): void {
     if (agentId) {
       const cached = cache.get(agentId, exec.name, argsHash)
       if (cached !== undefined) {
-        if (cached.approve) {
+        if (cached.decision.approve) {
           return next()
         }
-        return { kind: 'deny' as const, reason: `[AI审批缓存] ${cached.reason}` }
+        // Label the provenance: a replayed AI rejection and a replayed human
+        // rejection are different facts to whoever reads the denial.
+        const label = cached.source === 'human' ? '[人工审批缓存]' : '[AI审批缓存]'
+        return { kind: 'deny' as const, reason: `${label} ${cached.decision.reason}` }
       }
     }
 
@@ -672,10 +675,14 @@ export function apply(ctx: Context, config: ApprovalConfig): void {
       decision = { approve: false, reason: `审核启动失败，默认拒绝: ${String(error).slice(0, 80)}` }
     }
 
-    // Cache the result for 60s (same agent, same tool, same args)
-    if (agentId) {
-      cache.set(agentId, exec.name, argsHash, decision)
-    }
+    // NOTE: nothing is cached here on purpose. The decision at this point may
+    // still be a fallback (review timeout, truncated review, transport error,
+    // unparseable output). A fallback is not a decision, and replaying its
+    // default denial for 60s blocks the very call a reviewer or human might
+    // still approve without asking anyone again — the 2026-11-16 01:49 incident
+    // (`[AI审批缓存] 审核超时`) is exactly that failure. Only settled verdicts
+    // are cached: the AI path below, and an explicit human decision on the
+    // fallback path.
 
     // Record the settled review outcome into this plugin's settings document.
     const sessionId = exec.agent?.session?.id ?? exec.agent?.id ?? 'default'
@@ -692,17 +699,66 @@ export function apply(ctx: Context, config: ApprovalConfig): void {
           const outcome = await approval.request({
             agent: exec.agent,
             toolName: exec.name,
+            // `callId` is the platform's correlation key back to the tool call
+            // that was already streamed to the client: it is what lets a card
+            // render that call's detail (the `conversation.approval.detail`
+            // slot is keyed by it) instead of duplicating the arguments in the
+            // prompt, and what lets an out-of-process answerer match this
+            // request against the session's `approval/asked` event. Every
+            // platform caller passes it (dsh-sandbox's escalation is the
+            // reference shape).
+            //
+            // It is NOT a delivery gate. Verified in the 0.2.2-rc.1 sources:
+            // the gateway's `projectRemoteEventRequest` forwards any
+            // JSON-safe field and never requires `callId`, and the client's
+            // `answerApproval` tolerates its absence (it only drops the tool
+            // detail panel). The 2026-11-16 02:00/02:07 no-popup incidents
+            // produced an immediate 'unavailable' — a request that was refused
+            // or delegated at once, not one that timed out — and the platform
+            // collapses both a rejection and a non-vocabulary answer into that
+            // same outcome, so the actual refusal reason is swallowed
+            // upstream. Passing `callId` (and `displayReason`) matches the
+            // platform shape; whether it is sufficient is settled only by an
+            // observed prompt on a running host.
+            callId: exec.callId,
+            // Structured, localizable copy, exactly as the platform caller
+            // sends it: `reason` stays the plain-text explanation, while
+            // `displayReason` is what the card shows in the user's locale.
+            displayReason: {
+              en: `[AI review fallback] ${decision.reason}. Please confirm whether to run this call.`,
+              zh: `[AI审批回退] ${decision.reason}。请人工确认是否执行此命令。`,
+            },
             reason: `[AI审批回退] ${decision.reason}。请人工确认是否执行此命令：\n\`\`\`\n${exec.name} ${JSON.stringify(exec.arguments)}\n\`\`\`\n`,
             signal: controller.signal,
           })
           clearTimeout(timeoutId)
-          // 'allowed-once' → allow; everything else → deny
+          // 'allowed-once' → allow; everything else → deny. An explicit human
+          // decision is settled, so it is the one fallback outcome worth
+          // caching: keyed to this exact (agent, tool, args) it answers an
+          // identical retry without prompting the human twice. A timeout or an
+          // absent answerer is NOT a decision and never reaches the cache — and
+          // so does not shadow the next attempt.
           if (outcome === 'allowed-once') {
+            if (agentId) {
+              cache.set(agentId, exec.name, argsHash, {
+                decision: { approve: true, reason: '人工审批已批准（同一命令，60 秒内复用）' },
+                source: 'human',
+              })
+            }
             return next()
+          }
+          if (outcome === 'rejected' && agentId) {
+            cache.set(agentId, exec.name, argsHash, {
+              decision: { approve: false, reason: '人工审批已拒绝（同一命令，60 秒内复用）' },
+              source: 'human',
+            })
           }
           return {
             kind: 'deny' as const,
-            reason: `[人工审批] ${outcome === 'cancelled' ? '审批超时' : outcome === 'rejected' ? '用户拒绝' : '审批超时或不可用，已拒绝'}`,
+            // Repeat the fallback cause: a denial that only says "timed out" or
+            // "no answerer" hides whether the reviewer was truncated, the model
+            // failed, or nobody was listening — the three have different fixes.
+            reason: `[人工审批] ${humanOutcomeText(outcome)}，已拒绝（回退原因：${decision.reason}）`,
           }
         } catch {
           clearTimeout(timeoutId)
@@ -719,7 +775,12 @@ export function apply(ctx: Context, config: ApprovalConfig): void {
       }
     }
 
-    // Apply AI decision
+    // Apply AI decision. Reaching this point means the reviewer settled a
+    // verdict (every fallback returned above), so this is the single place an
+    // AI decision becomes a cache entry.
+    if (agentId) {
+      cache.set(agentId, exec.name, argsHash, { decision, source: 'ai' })
+    }
     if (decision.approve) {
       return next() // Approved → let the tool execute normally
     } else {
@@ -729,6 +790,28 @@ export function apply(ctx: Context, config: ApprovalConfig): void {
       }
     }
   })
+}
+
+/**
+ * Name a human-approval outcome exactly.
+ *
+ * `unavailable` is NOT a timeout: the platform returns it when no answerer
+ * claimed the request or the claiming answerer threw. That is an environment
+ * fault (no approval surface was connected), and folding it into "审批超时或
+ * 不可用" hid exactly the fact an operator needs — that no popup was ever
+ * shown, so no human was ever given the chance to decide.
+ */
+function humanOutcomeText(outcome: string): string {
+  switch (outcome) {
+    case 'cancelled':
+      return '审批超时（人工未在时限内响应）'
+    case 'rejected':
+      return '用户拒绝'
+    case 'unavailable':
+      return '无可用的人工审批应答者（审批界面未响应本次请求）'
+    default:
+      return `未知结果 ${String(outcome)}`
+  }
 }
 
 /** structured_output is the only tool reviewer subagents are allowed to call. */

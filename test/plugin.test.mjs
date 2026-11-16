@@ -408,8 +408,8 @@ function guardVerdict(ctx, exec) {
   return { kind: 'allow' }
 }
 
-function makeExec(agent, name = 'bash', args = { command: 'ls -la' }) {
-  return { name, arguments: args, agent, signal: new AbortController().signal }
+function makeExec(agent, name = 'bash', args = { command: 'ls -la' }, callId = 'call-test-1') {
+  return { name, arguments: args, agent, callId, signal: new AbortController().signal }
 }
 
 // ─── Registration & config ──────────────────────────────────────
@@ -961,4 +961,111 @@ test('client bundle is a well-formed ModuleLoader factory with new slots', () =>
   assert.ok(src.includes('configForms'), 'writes through the shared config form service')
   assert.ok(!src.includes('settings.plugin.item'), 'removed 0.1.x slot not referenced')
   new Function(src.replace('window.__ModuleLoader__', '({ load(){} })')) // syntax check
+})
+
+// ─── Fallback diagnostics and cache provenance ──────────────────
+
+test('a truncated review names maxTokens rather than hiding behind a parse failure', async (t) => {
+  const home = mkdtempSync(join(tmpdir(), 'dshst-'))
+  const { ctx, calls } = await bootstrap(t, { home })
+  // The 2026-11-16 shape (sessions 1811643c / 73f5036a): the reviewer burned its
+  // whole budget on reasoning and ended 'max-tokens' with nothing delivered.
+  ctx.services.get('subagents').nextResult = { output: [], stopReason: 'max-tokens' }
+  const verdict = await preExecute(ctx, makeExec(fakeAgent('sess-trunc', '/w'), 'bash', { command: 'echo 1' }))
+
+  assert.equal(verdict.kind, 'deny')
+  // The fallback still asks the human, but carries the true cause…
+  assert.equal(calls.approvalRequests.length, 1)
+  assert.match(calls.approvalRequests[0].reason, /maxTokens=\d+/)
+  assert.match(calls.approvalRequests[0].reason, /输出被截断/)
+  // …and the denial repeats it instead of the old generic/unrelated wording.
+  assert.match(verdict.reason, /输出被截断/)
+  assert.doesNotMatch(verdict.reason, /无法解析审批结果/)
+})
+
+test('a truncated review that still delivered a decision adopts it', async (t) => {
+  const home = mkdtempSync(join(tmpdir(), 'dshst-'))
+  const { ctx, calls } = await bootstrap(t, { home })
+  // Content first, exactly as for 'error': truncation AFTER a verdict arrived
+  // must not throw the verdict away.
+  ctx.services.get('subagents').nextResult = {
+    output: [],
+    structured: { approve: true, reason: '只读命令' },
+    stopReason: 'max-tokens',
+  }
+  const verdict = await preExecute(ctx, makeExec(fakeAgent('sess-trunc-ok', '/w'), 'bash', { command: 'echo 1' }))
+  assert.equal(verdict.kind, 'allow')
+  assert.equal(calls.approvalRequests.length, 0, 'a delivered verdict needs no human')
+})
+
+test('only settled decisions are cached: fallbacks are not, human verdicts are', async (t) => {
+  const home = mkdtempSync(join(tmpdir(), 'dshst-'))
+  const { ctx, calls } = await bootstrap(t, { home })
+  const subagents = ctx.services.get('subagents')
+  const approval = ctx.services.get('approval')
+  const agent = fakeAgent('sess-provenance', '/w')
+  const args = { command: 'identical-and-undecidable' }
+
+  // 1) No answerer claimed the approval (platform outcome 'unavailable' — the
+  //    2026-11-16 02:00 incident: no popup, no human, no decision). A fallback
+  //    default denial must never be cached: replaying it for the whole TTL is
+  //    what blocked the identical retry without asking anyone again.
+  approval.nextOutcome = 'unavailable'
+  subagents.nextResult = { output: [{ type: 'text', text: '我觉得没问题' }], stopReason: 'completed' }
+
+  const first = await preExecute(ctx, makeExec(agent, 'bash', args))
+  assert.equal(first.kind, 'deny')
+  assert.match(first.reason, /无可用的人工审批应答者/)
+  assert.equal(calls.startActivation.length, 1)
+
+  const second = await preExecute(ctx, makeExec(agent, 'bash', args))
+  assert.equal(second.kind, 'deny')
+  assert.equal(calls.startActivation.length, 2, 'a fallback denial is not replayed from the cache')
+  assert.equal(calls.approvalRequests.length, 2, 'the human is asked again')
+  assert.doesNotMatch(second.reason, /缓存/)
+
+  // 2) An explicit human rejection IS a settled decision → cached, replayed, and
+  //    labelled by provenance.
+  approval.nextOutcome = 'rejected'
+  const third = await preExecute(ctx, makeExec(agent, 'bash', args))
+  assert.equal(third.kind, 'deny')
+  assert.match(third.reason, /用户拒绝/)
+  assert.equal(calls.approvalRequests.length, 3)
+
+  const fourth = await preExecute(ctx, makeExec(agent, 'bash', args))
+  assert.equal(fourth.kind, 'deny')
+  assert.match(fourth.reason, /人工审批缓存/)
+  assert.equal(calls.startActivation.length, 3, 'the human verdict is replayed without a new review')
+  assert.equal(calls.approvalRequests.length, 3, 'and without asking the human again')
+})
+
+test('an AI verdict is still cached and labelled as an AI cache hit', async (t) => {
+  const home = mkdtempSync(join(tmpdir(), 'dshst-'))
+  const { ctx, calls } = await bootstrap(t, { home })
+  ctx.services.get('subagents').nextResult = { output: [], structured: { approve: false, reason: '高危命令' }, stopReason: 'completed' }
+  const agent = fakeAgent('sess-ai-cache', '/w')
+  const args = { command: 'rm -rf /' }
+  const first = await preExecute(ctx, makeExec(agent, 'bash', args))
+  const second = await preExecute(ctx, makeExec(agent, 'bash', args))
+  assert.equal(first.kind, 'deny')
+  assert.equal(second.kind, 'deny')
+  assert.match(second.reason, /AI审批缓存/)
+  assert.equal(calls.startActivation.length, 1)
+})
+
+test('the human-approval fallback carries the tool callId (the popup needs it)', async (t) => {
+  const home = mkdtempSync(join(tmpdir(), 'dshst-'))
+  const { ctx, calls } = await bootstrap(t, { home })
+  ctx.services.get('subagents').nextResult = { output: [{ type: 'text', text: '我觉得没问题' }], stopReason: 'completed' }
+  ctx.services.get('approval').nextOutcome = 'unavailable'
+  const exec = makeExec(fakeAgent('sess-callid', '/w'), 'bash', { command: 'echo 1' }, 'call-abc-123')
+  const verdict = await preExecute(ctx, exec)
+
+  assert.equal(verdict.kind, 'deny')
+  assert.equal(calls.approvalRequests.length, 1)
+  // The regression this pins down: a request without callId has no streamed
+  // tool call for the client to attach its card to, so the client delegates
+  // back and the platform answers 'unavailable' instantly — no popup at all.
+  assert.equal(calls.approvalRequests[0].callId, 'call-abc-123', 'the prompt must link to its tool call')
+  assert.match(verdict.reason, /无可用的人工审批应答者/)
 })

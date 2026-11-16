@@ -3,14 +3,30 @@
  *
  * Keyed by `(sessionId, toolName, argsHash)` with a 60-second TTL.
  * Cache entries are cleaned up automatically when they expire.
+ *
+ * Only SETTLED decisions may enter this cache — an AI verdict from the
+ * reviewer, or an explicit human decision on the fallback path. A default
+ * denial produced by a timeout, a truncated review, a transport error, or an
+ * absent approval answerer is NOT a decision: replaying it for the whole TTL
+ * would block the very call a reviewer or human might have approved, without
+ * anyone ever being asked again.
  */
 
 import type { ReviewDecision } from './types.ts'
 
 const CACHE_TTL_MS = 60_000
 
-interface CacheEntry {
+/** Who settled a cached decision — the only two sources worth replaying. */
+export type CachedDecisionSource = 'ai' | 'human'
+
+/** A replayable decision plus the provenance used to label a cache hit. */
+export interface CachedDecision {
   decision: ReviewDecision
+  source: CachedDecisionSource
+}
+
+interface CacheEntry {
+  value: CachedDecision
   expiresAt: number
 }
 
@@ -39,7 +55,7 @@ export class ApprovalCache {
   /**
    * Look up a cached decision. Returns undefined on miss or expiry.
    */
-  get(sessionId: string, toolName: string, argsHash: string): ReviewDecision | undefined {
+  get(sessionId: string, toolName: string, argsHash: string): CachedDecision | undefined {
     const key = `${sessionId}\0${toolName}\0${argsHash}`
     const entry = this.store.get(key)
     if (entry === undefined) return undefined
@@ -47,17 +63,20 @@ export class ApprovalCache {
       this.store.delete(key)
       return undefined
     }
-    return entry.decision
+    return entry.value
   }
 
   /**
-   * Store a decision in the cache with a 60-second TTL.
+   * Store a SETTLED decision in the cache with a 60-second TTL.
+   *
+   * Callers must not reach here with a fallback/timeout/error outcome; those
+   * deliberately never become cache entries.
    */
-  set(sessionId: string, toolName: string, argsHash: string, decision: ReviewDecision): void {
+  set(sessionId: string, toolName: string, argsHash: string, value: CachedDecision): void {
     if (this.disposed) return
     const key = `${sessionId}\0${toolName}\0${argsHash}`
     this.store.set(key, {
-      decision,
+      value,
       expiresAt: Date.now() + CACHE_TTL_MS,
     })
   }

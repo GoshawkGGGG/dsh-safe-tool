@@ -333,7 +333,23 @@ export async function startReviewer(
         : '模型未交付结构化结果，且输出无可解析决策'
       return { approve: false, reason: `审核服务异常：${detail}` }
     }
-    return extractDecision(result as { structured?: unknown; output?: ContentBlock[] })
+    const settled = extractDecision(result as { structured?: unknown; output?: ContentBlock[] })
+    if (settled.fallback !== true) return settled
+
+    // Nothing usable was delivered. Name the real cause when the run was cut
+    // short by its token budget: a reasoning-heavy reviewer can spend the entire
+    // budget thinking and never call `structured_output`, and the generic
+    // parse-failure text hid that — the remedy is a larger `maxTokens`, not a
+    // larger timeout. Control flow is unchanged (an undecidable review falls
+    // back to the human); only the reason becomes truthful.
+    if (result?.stopReason === 'max-tokens') {
+      return {
+        approve: false,
+        fallback: true,
+        reason: `审核未完成：审核模型未能在 maxTokens=${request.maxTokens} 内产出决策（输出被截断）`,
+      }
+    }
+    return settled
   } catch (error) {
     if (controller.signal.aborted) {
       return {
