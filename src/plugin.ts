@@ -675,14 +675,12 @@ export function apply(ctx: Context, config: ApprovalConfig): void {
       decision = { approve: false, reason: `审核启动失败，默认拒绝: ${String(error).slice(0, 80)}` }
     }
 
-    // NOTE: nothing is cached here on purpose. The decision at this point may
-    // still be a fallback (review timeout, truncated review, transport error,
-    // unparseable output). A fallback is not a decision, and replaying its
-    // default denial for 60s blocks the very call a reviewer or human might
-    // still approve without asking anyone again — the 2026-11-16 01:49 incident
-    // (`[AI审批缓存] 审核超时`) is exactly that failure. Only settled verdicts
-    // are cached: the AI path below, and an explicit human decision on the
-    // fallback path.
+    // Nothing is cached here: the decision may still be a fallback (review
+    // timeout, truncated review, transport error, unparseable output). A
+    // fallback is not a verdict — replaying its default denial for 60s would
+    // block a call a reviewer or human might still approve, without asking
+    // anyone again. Only settled verdicts are cached: the AI path below, and an
+    // explicit human decision on the fallback path.
 
     // Record the settled review outcome into this plugin's settings document.
     const sessionId = exec.agent?.session?.id ?? exec.agent?.id ?? 'default'
@@ -700,26 +698,12 @@ export function apply(ctx: Context, config: ApprovalConfig): void {
             agent: exec.agent,
             toolName: exec.name,
             // `callId` is the platform's correlation key back to the tool call
-            // that was already streamed to the client: it is what lets a card
-            // render that call's detail (the `conversation.approval.detail`
-            // slot is keyed by it) instead of duplicating the arguments in the
-            // prompt, and what lets an out-of-process answerer match this
-            // request against the session's `approval/asked` event. Every
-            // platform caller passes it (dsh-sandbox's escalation is the
-            // reference shape).
-            //
-            // It is NOT a delivery gate. Verified in the 0.2.2-rc.1 sources:
-            // the gateway's `projectRemoteEventRequest` forwards any
-            // JSON-safe field and never requires `callId`, and the client's
-            // `answerApproval` tolerates its absence (it only drops the tool
-            // detail panel). The 2026-11-16 02:00/02:07 no-popup incidents
-            // produced an immediate 'unavailable' — a request that was refused
-            // or delegated at once, not one that timed out — and the platform
-            // collapses both a rejection and a non-vocabulary answer into that
-            // same outcome, so the actual refusal reason is swallowed
-            // upstream. Passing `callId` (and `displayReason`) matches the
-            // platform shape; whether it is sufficient is settled only by an
-            // observed prompt on a running host.
+            // already streamed to the client: the card renders that call's
+            // detail (the `conversation.approval.detail` slot is keyed by it)
+            // instead of duplicating arguments, and an out-of-process answerer
+            // can match the request against the session's `approval/asked`
+            // event. It is NOT a delivery gate: the gateway forwards any
+            // JSON-safe request and the client tolerates its absence.
             callId: exec.callId,
             // Structured, localizable copy, exactly as the platform caller
             // sends it: `reason` stays the plain-text explanation, while

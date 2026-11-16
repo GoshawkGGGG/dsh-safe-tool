@@ -731,7 +731,7 @@ test('every terminal stop reason maps to the 0.1.x outcome', async (t) => {
     // Content first: a delivered structured decision is adopted even under an
     // 'error' classification (the child delivered its verdict, then failed).
     { stopReason: 'error', result: { output: [], structured: { approve: true, reason: '看起来没问题' } }, expect: 'allow', matches: null },
-    // The 2026-11-13 regression (session 9364a260): the framework rewrites a
+    // A text-only completion: the framework rewrites a
     // text-only completion to stopReason 'error' with NO diagnostic; the plain
     // answer in `output` is a complete decision and must be adopted.
     {
@@ -968,7 +968,7 @@ test('client bundle is a well-formed ModuleLoader factory with new slots', () =>
 test('a truncated review names maxTokens rather than hiding behind a parse failure', async (t) => {
   const home = mkdtempSync(join(tmpdir(), 'dshst-'))
   const { ctx, calls } = await bootstrap(t, { home })
-  // The 2026-11-16 shape (sessions 1811643c / 73f5036a): the reviewer burned its
+  // A reviewer that burns its whole budget on reasoning ends here:
   // whole budget on reasoning and ended 'max-tokens' with nothing delivered.
   ctx.services.get('subagents').nextResult = { output: [], stopReason: 'max-tokens' }
   const verdict = await preExecute(ctx, makeExec(fakeAgent('sess-trunc', '/w'), 'bash', { command: 'echo 1' }))
@@ -1007,7 +1007,7 @@ test('only settled decisions are cached: fallbacks are not, human verdicts are',
   const args = { command: 'identical-and-undecidable' }
 
   // 1) No answerer claimed the approval (platform outcome 'unavailable' — the
-  //    2026-11-16 02:00 incident: no popup, no human, no decision). A fallback
+  //    no answerer claimed the approval: no prompt, no human, no decision). A fallback
   //    default denial must never be cached: replaying it for the whole TTL is
   //    what blocked the identical retry without asking anyone again.
   approval.nextOutcome = 'unavailable'
