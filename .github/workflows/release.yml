@@ -82,7 +82,7 @@ jobs:
         run: |
           mkdir -p dist
           pnpm pack --pack-destination dist
-          (cd dist && sha256sum ./*.tgz > checksums.txt)
+          (cd dist && sha256sum *.tgz > checksums.txt)
 
       - name: Compose release notes
         if: steps.gate.outputs.exists == 'false'
