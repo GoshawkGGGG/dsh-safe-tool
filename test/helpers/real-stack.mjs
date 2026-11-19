@@ -132,12 +132,12 @@ export async function withRealStack(t, { home, structured, config } = {}) {
           version: SESSION_FORMAT_VERSION,
           id: childId,
           createdAt: Date.now(),
-          cwd: spec.request.cwd,
-          parentSession: String(spec.request.parent.session.id),
+          cwd: spec.cwd,
+          parentSession: String(spec.parent.session.id),
           isSeeded: false,
           origin: 'subagent',
           delegationDepth: 1,
-          ...(spec.request.agentPreset !== undefined ? { agentPreset: spec.request.agentPreset } : {}),
+          ...(spec.agentPreset !== undefined ? { agentPreset: spec.agentPreset } : {}),
         }))
         // `create` alone persists nothing: a real review child appends events and
         // flushes, which is what materializes its artifact directory.

@@ -656,10 +656,15 @@ test('approve decision lets the call through and records stats', async (t) => {
   assert.equal(spec.provider, 'spawn')
   assert.equal(spec.label, 'ai-approval-reviewer')
   assert.equal(spec.delivery, 'caller')
-  assert.equal(spec.request.cwd, ctx.REVIEWER_WORKSPACE, 'reviewer child cwd pinned to plugin workspace')
-  assert.equal(spec.request.agentPreset, undefined, 'dedicated parent already mounts the preset')
-  assert.ok(spec.request.prompt[0].text.includes('Run commands in a bash shell'), 'tool description embedded in prompt')
-  assert.ok(spec.request.outputSchema.properties.approve, 'outputSchema declares approve')
+  assert.equal(spec.cwd, ctx.REVIEWER_WORKSPACE, 'reviewer child cwd pinned to plugin workspace')
+  assert.equal(spec.agentPreset, undefined, 'dedicated parent already mounts the preset')
+  assert.ok(spec.prompt[0].text.includes('Run commands in a bash shell'), 'tool description embedded in prompt')
+  assert.ok(spec.outputSchema.properties.approve, 'outputSchema declares approve')
+  // Contract pin (dsh 0.2.2-rc.4): the task fields live at the top level of the
+  // activation spec. Nesting them under `request` left `spec.parent`
+  // undefined, and the runtime threw reading `spec.parent.id` on every review.
+  assert.equal('request' in spec, false, 'activation spec is flat')
+  assert.ok(spec.parent?.id, 'spec carries the parent agent at the top level')
 
   // Stats recorded through the storage domain and served by the bridge.
   const listed = await ctx.web.post('/api/dsh-safe-tool-settings/stats-list')
@@ -796,8 +801,8 @@ test('reviewer preset mount failure falls back to the main agent with agentPrese
   const verdict = await preExecute(ctx, makeExec(fakeAgent('main-1', '/workspaces/main')))
   assert.equal(verdict.kind, 'allow')
   const spec = calls.startActivation.at(-1)
-  assert.equal(spec.request.parent.id, 'main-1', 'spawned under the main agent')
-  assert.equal(spec.request.agentPreset, 'minimal', 'child composition pinned to the reviewer preset')
+  assert.equal(spec.parent.id, 'main-1', 'spawned under the main agent')
+  assert.equal(spec.agentPreset, 'minimal', 'child composition pinned to the reviewer preset')
 })
 
 test('60s cache reuses a settled decision (no second spawn)', async (t) => {

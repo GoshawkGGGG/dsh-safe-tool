@@ -1,11 +1,15 @@
 /**
  * Review subagent launcher.
  *
- * 0.2.x adaptation (dsh 0.2.1-rc.2):
- * - Children start through `subagents.startActivation({ provider: 'spawn',
- *   label, request, signal, delivery: 'caller' })`. The old
- *   `subagents.start(name, request)` seam and its top-level `toolFilter`
- *   field are gone; the reviewer's tool allowlist is enforced by the plugin's
+ * 0.2.x adaptation (dsh 0.2.2-rc.4):
+ * - Children start through `subagents.startActivation(spec)` with the task
+ *   fields as TOP-LEVEL spec members (`parent`, `prompt`, `cwd`,
+ *   `agentPreset`, `agentOptions`, `outputSchema`, `signal`, `delivery`).
+ *   The earlier nested `request` object no longer exists: nesting them leaves
+ *   `spec.parent` undefined, and the runtime then throws while reading
+ *   `spec.parent.id`. The old `subagents.start(name, request)` seam and its
+ *   top-level `toolFilter` field are gone; the reviewer's tool allowlist is
+ *   enforced by the plugin's
  *   `tools/pre-execute` guard (reviewer children may only call
  *   `structured_output`), and the tool composition comes from the dedicated
  *   reviewer parent's preset.
@@ -24,6 +28,10 @@
 
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
+// Type-only (erased at build time): the shipped bundle must not import host
+// packages, but binding the real activation contracts turns a platform
+// contract change into a compile error instead of a runtime TypeError.
+import type { SubagentActivation, SubagentActivationSpec, SubagentRuntime } from '@deepseek-ai/dsh-subagent'
 import type { SessionHeader } from '@deepseek-ai/dsh-session'
 import { rmSync } from 'node:fs'
 import { join } from 'node:path'
@@ -209,13 +217,6 @@ export interface ReviewerSessionTarget {
   cwd?: string | undefined
 }
 
-/** Subset of the activation the launcher consumes. */
-interface ReviewActivation {
-  childId: string
-  result: Promise<{ output?: unknown; structured?: unknown; diagnostic?: unknown; stopReason?: string }>
-  dispose: () => Promise<void>
-}
-
 /**
  * Start a read-only review subagent and return its decision.
  *
@@ -233,21 +234,15 @@ export async function startReviewer(
   request: ReviewerRequest,
   parent: Agent,
 ): Promise<ReviewDecision> {
-  // ctx.subagents is a declared inject — access directly, not ctx.get
-  const subagents = (ctx as unknown as Record<string, unknown>).subagents as {
-    startActivation?: (spec: Record<string, unknown>) => Promise<ReviewActivation>
-    getProvider?: (name: string) => { name: string } | undefined
-    list?: () => string[]
-  }
-  if (!subagents?.startActivation) {
+  // ctx.subagents is a declared inject — access directly, not ctx.get.
+  const subagents = (ctx as unknown as { subagents?: SubagentRuntime }).subagents
+  if (typeof subagents?.startActivation !== 'function') {
     throw new Error(
       'dsh-safe-tool: subagents.startActivation not available — '
       + 'ensure @deepseek-ai/dsh-subagent-spawn-in-process is composed in the profile.',
     )
   }
-  const providerName = subagents.getProvider?.('spawn') !== undefined || subagents.list?.().includes('spawn')
-    ? 'spawn'
-    : undefined
+  const providerName = subagents.getProvider('spawn') !== undefined ? 'spawn' : undefined
   if (providerName === undefined) {
     throw new Error('dsh-safe-tool: no `spawn` subagent provider registered')
   }
@@ -256,7 +251,7 @@ export async function startReviewer(
   const controller = new AbortController()
   const timeoutId = setTimeout(() => controller.abort(), request.timeoutMs)
 
-  let run: ReviewActivation | undefined
+  let run: SubagentActivation | undefined
 
   try {
     // Start the review subagent with zero execution permissions:
@@ -267,38 +262,37 @@ export async function startReviewer(
     //   generation — 0.2.x routes tool composition through presets; the
     //   start-time `toolFilter` field no longer exists.
     // - `outputSchema` registers the child-scoped `structured_output` tool.
-    run = await subagents.startActivation({
+    const spec: SubagentActivationSpec = {
       provider: providerName,
       label: 'ai-approval-reviewer',
-      request: {
-        cwd: request.cwd,
-        ...(request.agentPreset !== undefined ? { agentPreset: request.agentPreset } : {}),
-        prompt: [{ type: 'text', text: request.prompt }],
-        parent,
-        agentOptions: {
-          ...(request.provider !== undefined ? { provider: request.provider } : {}),
-          ...(request.model !== undefined ? { model: request.model } : {}),
-          maxTokens: request.maxTokens,
-        },
-        outputSchema: {
-          type: 'object' as const,
-          required: ['approve', 'reason'] as const,
-          properties: {
-            approve: {
-              type: 'boolean',
-              description: '是否批准该工具调用执行。true=批准，false=拒绝。',
-            },
-            reason: {
-              type: 'string',
-              description: '批准或拒绝的原因，使用中文，简明扼要，不超过50字。',
-            },
+      parent,
+      cwd: request.cwd,
+      ...(request.agentPreset !== undefined ? { agentPreset: request.agentPreset } : {}),
+      prompt: [{ type: 'text', text: request.prompt }],
+      agentOptions: {
+        ...(request.provider !== undefined ? { provider: request.provider } : {}),
+        ...(request.model !== undefined ? { model: request.model } : {}),
+        maxTokens: request.maxTokens,
+      },
+      outputSchema: {
+        type: 'object' as const,
+        required: ['approve', 'reason'] as const,
+        properties: {
+          approve: {
+            type: 'boolean',
+            description: '是否批准该工具调用执行。true=批准，false=拒绝。',
           },
-          additionalProperties: false,
+          reason: {
+            type: 'string',
+            description: '批准或拒绝的原因，使用中文，简明扼要，不超过50字。',
+          },
         },
+        additionalProperties: false,
       },
       signal: controller.signal,
       delivery: 'caller',
-    })
+    }
+    run = await subagents.startActivation(spec)
 
     // Wait for the subagent to complete. The promise resolves (never rejects)
     // with the terminal SubagentResult; a model/transport failure arrives as
@@ -326,14 +320,14 @@ export async function startReviewer(
       // and adopt a complete decision instead of discarding it; only an
       // undecipherable result fails closed, named by the diagnostic when the
       // framework provided one.
-      const fromContent = extractDecision(result as { structured?: unknown; output?: ContentBlock[] })
+      const fromContent = extractDecision(result)
       if (fromContent.fallback !== true) return fromContent
       const detail = typeof result.diagnostic === 'string' && result.diagnostic.length > 0
         ? result.diagnostic.slice(0, 80)
         : '模型未交付结构化结果，且输出无可解析决策'
       return { approve: false, reason: `审核服务异常：${detail}` }
     }
-    const settled = extractDecision(result as { structured?: unknown; output?: ContentBlock[] })
+    const settled = extractDecision(result)
     if (settled.fallback !== true) return settled
 
     // Nothing usable was delivered. Name the real cause when the run was cut
@@ -407,7 +401,7 @@ export async function startReviewer(
  */
 function extractDecision(result: {
   structured?: unknown
-  output?: ContentBlock[]
+  output?: readonly ContentBlock[]
   stopReason?: string
 }): ReviewDecision {
   // Priority 1: structured output (guaranteed by outputSchema)
@@ -429,7 +423,7 @@ function extractDecision(result: {
 }
 
 /** Join every text/reasoning block in order (raw-JSON models may split output). */
-function collectDecisionText(output?: ContentBlock[]): string {
+function collectDecisionText(output?: readonly ContentBlock[]): string {
   if (!Array.isArray(output)) return ''
   const parts: string[] = []
   for (const block of output) {
